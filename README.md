@@ -9,7 +9,7 @@ version = "0.0.1"
 schema_version = 1
 authors = ["cd"]
 description = ""
-repository = "https://github.com/your-name/my-zed-extension"
+repository = "https://github.com/CharlieADavies/zed-theme-generator"
 ```
 
 ```json
