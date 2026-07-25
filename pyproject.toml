@@ -1,0 +1,27 @@
+[project]
+name = "zed-theme-generator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Charlie  Davies", email = "charlieadavies@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "coloraide>=8.10",
+    "cyclopts>=4.22.2",
+]
+
+[project.scripts]
+zed-theme-generator = "zed_theme_generator:main"
+
+[build-system]
+requires = ["uv_build>=0.11.11,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.1.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.0",
+]
