@@ -563,6 +563,7 @@ name = "zed-theme-generator"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "annotated-types" },
     { name = "coloraide" },
     { name = "cyclopts" },
     { name = "pydantic" },
@@ -579,6 +580,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "annotated-types", specifier = ">=0.7.0" },
     { name = "coloraide", specifier = ">=8.10" },
     { name = "cyclopts", specifier = ">=4.22.2" },
     { name = "pydantic", specifier = ">=2.13.4" },

@@ -14,35 +14,35 @@ derived roles (muted text, comments, chrome) move.
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import cached_property
-from typing import ClassVar, Literal, Self, override
+from typing import ClassVar, Self, override
 
 from coloraide import Color
 
-from zed_theme_generator import (
-    DARK_DIRECTION,
+from zed_theme_generator.gen.zed_theme import AppearanceContent, ThemeStyleContent
+from zed_theme_generator.generator import (
     FALLBACK_ACCENT_HUE,
-    GENERATORS,
     HUE_BLUE,
     HUE_GREEN,
     HUE_RED,
     HUE_YELLOW,
-    LIGHT_DIRECTION,
-    Palette,
     ThemeGenerator,
-    app,
     band,
-    build_style,
     elevate,
     ensure_contrast,
-    hex_rgba,
     hue_distance,
     palette_comment,
-    register_themes,
+)
+from zed_theme_generator.schemas import (
+    DARK_DIRECTION,
+    LIGHT_DIRECTION,
+    Palette,
+    RainbowInputs,
+    build_style,
+    hex_rgba,
     shift_l,
 )
-from zed_theme_generator.gen.zed_theme import AppearanceContent, ThemeStyleContent
 
 # Cycle repeats push lightness away from the background by this much per lap
 # around the input list, so a repeat's contrast never drops below its base's.
@@ -503,28 +503,16 @@ class RainbowThemeGenerator(ThemeGenerator):
         "the background is taken as given or chosen to clear contrast floors "
         "while maximising OKLab distance from the colours"
     )
+    inputs_spec: ClassVar[type] = RainbowInputs
 
     def __init__(self, params: RainbowParams) -> None:
         self.params = params
 
     @classmethod
-    def from_cli(
-        cls,
-        *,
-        name: str,
-        colors: Sequence[str],
-        background: str | None = None,
-        status_colors: Sequence[str] | None = None,
-    ) -> Self:
-        """Resolve raw CLI strings into generation parameters."""
-        return cls(
-            RainbowParams.from_strings(
-                name=name,
-                colors=colors,
-                background=background,
-                status_colors=status_colors,
-            )
-        )
+    @override
+    def from_inputs(cls, inputs: RainbowInputs) -> Self:
+        """Build a generator from a validated inputs spec."""
+        return cls(RainbowParams.from_strings(**asdict(inputs)))
 
     @cached_property
     def palette(self) -> Palette:
@@ -558,50 +546,3 @@ class RainbowThemeGenerator(ThemeGenerator):
             "inputs: " + json.dumps(inputs, separators=(",", ":")),
             palette_comment(self.palette),
         ]
-
-
-GENERATORS[RainbowThemeGenerator.generator_name] = RainbowThemeGenerator
-
-
-# --- CLI ----------------------------------------------------------------------
-
-
-@app.command(name="rainbow")
-def rainbow(
-    name: str,
-    *colors: str,
-    background: str | None = None,
-    status_colors: list[str] | None = None,
-    register: bool = False,
-    if_exists: Literal["overwrite", "raise"] = "overwrite",
-) -> None:
-    """Generate a Zed theme from a weight-ordered colour list used verbatim.
-
-    Parameters
-    ----------
-    name
-        Theme (and file) name; the theme appears in Zed as `<name>-dark` or
-        `<name>-light` depending on the background's lightness.
-    colors
-        Two or more CSS colour strings, most significant first; they appear
-        verbatim in the most prominent theme roles.
-    background
-        Background colour for both editor and UI (any CSS colour string),
-        used verbatim; when omitted the background is chosen to clear
-        contrast floors and maximise OKLab distance to the colours.
-    status_colors
-        Exactly four CSS colour strings (error, warning, success, info) used
-        verbatim; derived from the hue anchors when omitted.
-    register
-        Also copy the generated theme into ~/.config/zed/themes.
-    if_exists
-        What to do when registering over an existing theme file.
-    """
-    generator = RainbowThemeGenerator.from_cli(
-        name=name, colors=colors, background=background, status_colors=status_colors
-    )
-    style = generator.build_theme()
-    path = generator.save_theme(style, name=name)
-    print(f"Wrote {path}")
-    if register:
-        register_themes(name, if_exists)

@@ -10,22 +10,33 @@ from support import NEON
 from zed_theme_generator import HarmonicPaletteThemeGenerator, ThemeGenerator
 from zed_theme_generator.light import HarmonicLightPaletteThemeGenerator
 from zed_theme_generator.rainbow import RainbowThemeGenerator
+from zed_theme_generator.schemas import HarmonicInputs, RainbowInputs
 
 
 def _pinkish() -> ThemeGenerator:
-    return HarmonicPaletteThemeGenerator.from_cli(
-        name="pinkish", background="#0a1022", foreground="#ffe3f3", accent="#ee7ec6"
+    return HarmonicPaletteThemeGenerator.from_inputs(
+        HarmonicInputs(
+            name="pinkish",
+            background="#0a1022",
+            foreground="#ffe3f3",
+            accent="#ee7ec6",
+        )
     )
 
 
 def _rosewater() -> ThemeGenerator:
-    return HarmonicLightPaletteThemeGenerator.from_cli(
-        name="rosewater", background="#fdf4f8", foreground="#2b1930", accent="#c02579"
+    return HarmonicLightPaletteThemeGenerator.from_inputs(
+        HarmonicInputs(
+            name="rosewater",
+            background="#fdf4f8",
+            foreground="#2b1930",
+            accent="#c02579",
+        )
     )
 
 
 def _vomit() -> ThemeGenerator:
-    return RainbowThemeGenerator.from_cli(name="vomit", colors=NEON)
+    return RainbowThemeGenerator.from_inputs(RainbowInputs(name="vomit", colors=NEON))
 
 
 @pytest.mark.parametrize(
@@ -52,4 +63,4 @@ def test_save_theme_round_trip(
     (theme,) = payload["themes"]
     appearance = generator.theme_appearance().value
     assert theme["appearance"] == appearance
-    assert theme["name"] == f"{name}-{appearance}"
+    assert theme["name"] == name
