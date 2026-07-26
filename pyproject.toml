@@ -19,6 +19,8 @@ project-includes = [
     "**/*.py*",
     "**/*.ipynb",
 ]
+# pytest puts tests/ on sys.path, so test modules import `support` directly
+search-path = ["src", "tests"]
 
 [tool.ruff]
 # datamodel-codegen output; regenerated from zed_schema_v0.2.0.json, not hand-edited
@@ -34,6 +36,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "datamodel-code-generator>=0.71.0",
+    "hypothesis>=6.161.5",
     "pyrefly>=1.1.1",
     "pytest>=9.1.1",
     "ruff>=0.16.0",
