@@ -42,8 +42,10 @@ EXTENSION_REPOSITORY = "https://github.com/CharlieADavies/zed-theme-generator"
 # --- structural constants (fixed semantics, not tuning knobs) -----------------
 
 MAX_L = 0.985
+MIN_L = 0.015  # light-mode ramps stop short of pure black, mirroring MAX_L
 CONTRAST_STEP = 0.01
-DARK_DIRECTION = 1.0  # raise lightness away from dark backgrounds; flip for light mode
+DARK_DIRECTION = 1.0  # raise lightness away from dark backgrounds
+LIGHT_DIRECTION = -1.0  # lower lightness away from light backgrounds
 
 STATUS_ANCHOR_TOLERANCE = 15.0  # status hues must stay recognisable (red error etc.)
 FALLBACK_ACCENT_HUE = 343.0  # pink, for achromatic accent inputs
@@ -409,9 +411,19 @@ def floor_lightness(
     return MAX_L if direction > 0 else 0.0
 
 
-def band(hue: float, chroma: float, bg: Color, *, floor: float) -> Color:
-    """The darkest colour at (chroma, hue) meeting `floor` — the floor selects L."""
-    lightness = floor_lightness(hue, chroma, bg, floor)
+def band(
+    hue: float,
+    chroma: float,
+    bg: Color,
+    *,
+    floor: float,
+    direction: float = DARK_DIRECTION,
+) -> Color:
+    """The bg-nearest colour at (chroma, hue) meeting `floor` — the floor selects L.
+
+    Darkest on a dark background, lightest on a light one.
+    """
+    lightness = floor_lightness(hue, chroma, bg, floor, direction=direction)
     return Color("oklch", [lightness, chroma, hue]).fit("srgb")
 
 
@@ -423,6 +435,7 @@ def ladder(
     top: Color,
     floor: float,
     rungs: int = LADDER_RUNGS,
+    direction: float = DARK_DIRECTION,
 ) -> list[Color]:
     """Floor-anchored rungs interpolated from the band colour towards `top`.
 
@@ -430,7 +443,7 @@ def ladder(
     `top`'s own hue flips direction at the antipode and drifts every high rung
     towards it.
     """
-    base = band(hue, chroma, bg, floor=floor)
+    base = band(hue, chroma, bg, floor=floor, direction=direction)
     capped = top.convert("oklch")
     capped["hue"] = hue
     return Color.steps([base, capped], steps=rungs, space="oklch")
@@ -477,22 +490,29 @@ def highlight(
 
 
 def _ramp_candidates(
-    hue: float, chroma: float, bg: Color, floor: float, seed_l: float, prefer_up: bool
+    hue: float,
+    chroma: float,
+    bg: Color,
+    floor: float,
+    seed_l: float,
+    prefer_up: bool,
+    direction: float = DARK_DIRECTION,
 ) -> list[Color]:
     """Colours sampled along the legal lightness ramp at (chroma, hue).
 
-    The ramp interpolates from the darkest colour clearing `floor` up to
-    `MAX_L`, so every candidate satisfies WCAG by construction (contrast is
-    monotonic in lightness above the floor on a dark background). Candidates
-    come back nearest-to-`seed_l` first, ties broken towards the preferred
-    direction.
+    The ramp interpolates the lightness band clearing `floor` — floor to
+    `MAX_L` on dark backgrounds, `MIN_L` to floor on light ones — so every
+    candidate satisfies WCAG by construction (contrast is monotonic in
+    lightness on the far side of the floor). Candidates come back
+    nearest-to-`seed_l` first, ties broken towards the preferred direction.
     """
-    lo = floor_lightness(hue, chroma, bg, floor)
+    floor_l = floor_lightness(hue, chroma, bg, floor, direction=direction)
+    lo, hi = (floor_l, MAX_L) if direction > 0 else (MIN_L, floor_l)
     ramp = Color.interpolate(
-        [Color("oklch", [lo, chroma, hue]), Color("oklch", [MAX_L, chroma, hue])],
+        [Color("oklch", [lo, chroma, hue]), Color("oklch", [hi, chroma, hue])],
         space="oklch",
     )
-    span = MAX_L - lo
+    span = hi - lo
     seed_t = 0.0 if span <= 0 else min(1.0, max(0.0, (seed_l - lo) / span))
     steps = [i / 40 for i in range(41)]
 
@@ -510,6 +530,7 @@ def separate_text_roles(
     *,
     min_delta: float,
     default_floor: float,
+    direction: float = DARK_DIRECTION,
 ) -> dict[str, Color]:
     """Place text colours so every pair is >= `min_delta` apart in OKLab.
 
@@ -530,6 +551,7 @@ def separate_text_roles(
             floor=floors.get(name, default_floor),
             min_delta=min_delta,
             prefer_up=index % 2 == 0,
+            direction=direction,
         )
     return placed
 
@@ -542,6 +564,7 @@ def _place_role(
     floor: float,
     min_delta: float,
     prefer_up: bool,
+    direction: float = DARK_DIRECTION,
 ) -> Color:
     placed = list(seniors)
 
@@ -561,7 +584,7 @@ def _place_role(
     for offset in hue_offsets:
         hue = (seed["hue"] + offset) % 360
         for candidate in _ramp_candidates(
-            hue, seed["chroma"], bg, floor, seed["lightness"], prefer_up
+            hue, seed["chroma"], bg, floor, seed["lightness"], prefer_up, direction
         ):
             score = clearance(candidate)
             if score >= min_delta:
@@ -575,13 +598,24 @@ def _place_role(
 # --- palette selection ---------------------------------------------------------
 
 
-def select_colors(params: ThemeParams) -> Palette:
-    """Fill every palette role: harmony-seeded hues, contrast-floored lightness."""
+def select_colors(
+    params: ThemeParams, *, direction: float = DARK_DIRECTION
+) -> Palette:
+    """Fill every palette role: harmony-seeded hues, contrast-floored lightness.
+
+    `direction` is `DARK_DIRECTION` for dark backgrounds and `LIGHT_DIRECTION`
+    for light ones; every floor walk and chrome elevation follows it.
+    """
     bg = params.background.convert("oklch")
-    if bg["lightness"] >= 0.5:
+    if direction > 0 and bg["lightness"] >= 0.5:
         raise ValueError(
-            "Only dark backgrounds are supported for now "
+            "Dark generation needs a dark background "
             f"(oklch lightness {bg['lightness']:.2f} >= 0.5)"
+        )
+    if direction < 0 and bg["lightness"] < 0.5:
+        raise ValueError(
+            "Light generation needs a light background "
+            f"(oklch lightness {bg['lightness']:.2f} < 0.5)"
         )
     bg["chroma"] = min(bg["chroma"], params.bg_chroma_cap)
     bg.fit("srgb")
@@ -593,15 +627,20 @@ def select_colors(params: ThemeParams) -> Palette:
     accent_chroma = min(
         max(accent["chroma"], params.syntax_chroma), params.accent_chroma_cap
     )
-    accent = band(accent["hue"], accent_chroma, bg, floor=params.floor_syntax)
+    accent = band(
+        accent["hue"], accent_chroma, bg, floor=params.floor_syntax, direction=direction
+    )
     accent_hue = accent["hue"]
 
     # The input foreground keeps its own lightness; minimum_bg_contrast is a
     # floor, not a target, so brightness beyond it comes from the input colour.
     fg_editor = params.foreground.convert("oklch")
-    fg_editor["lightness"] = min(MAX_L, fg_editor["lightness"])
+    if direction > 0:
+        fg_editor["lightness"] = min(MAX_L, fg_editor["lightness"])
+    else:
+        fg_editor["lightness"] = max(MIN_L, fg_editor["lightness"])
     fg_editor.fit("srgb")
-    fg_editor = ensure_contrast(fg_editor, bg, params.floor_primary)
+    fg_editor = ensure_contrast(fg_editor, bg, params.floor_primary, direction=direction)
 
     # The accent's lightness is masked out of the mix: UI text takes the
     # accent's hue and chroma but keeps the editor foreground's lightness,
@@ -610,7 +649,7 @@ def select_colors(params: ThemeParams) -> Palette:
     text = fg_editor.mix(
         accent.mask("lightness"), params.ui_accent_mix, space="oklch"
     )
-    text = ensure_contrast(text, bg, params.floor_primary)
+    text = ensure_contrast(text, bg, params.floor_primary, direction=direction)
 
     # Harmony families: full wheel colours from the accent carry its chroma
     # into every family.
@@ -627,13 +666,20 @@ def select_colors(params: ThemeParams) -> Palette:
             * multiplier
         )
         return ladder(
-            hue, chroma, bg=bg, top=fg_editor, floor=params.floor_syntax
+            hue,
+            chroma,
+            bg=bg,
+            top=fg_editor,
+            floor=params.floor_syntax,
+            direction=direction,
         )[rung]
 
     def status_band(anchor: float) -> Color:
         # Status colours: hue-anchored tightly so semantics stay legible.
         hue = nearest_wheel_hue(wheel_hues, anchor, STATUS_ANCHOR_TOLERANCE)
-        return band(hue, params.syntax_chroma, bg, floor=params.floor_syntax)
+        return band(
+            hue, params.syntax_chroma, bg, floor=params.floor_syntax, direction=direction
+        )
 
     error = status_band(HUE_RED)
     warning = status_band(HUE_YELLOW)
@@ -687,10 +733,14 @@ def select_colors(params: ThemeParams) -> Palette:
     comment = mono[2].clone()
     comment["chroma"] = min(comment["chroma"], params.comment_chroma_cap)
     comment["hue"] = hue_towards(comment["hue"], bg_hue, params.syntax_cast)
-    comment["lightness"] = max(
-        comment["lightness"],
-        floor_lightness(comment["hue"], comment["chroma"], bg, params.floor_muted),
+    # On a light background the floor lightness is a ceiling, not a floor.
+    comment_floor_l = floor_lightness(
+        comment["hue"], comment["chroma"], bg, params.floor_muted, direction=direction
     )
+    if direction > 0:
+        comment["lightness"] = max(comment["lightness"], comment_floor_l)
+    else:
+        comment["lightness"] = min(comment["lightness"], comment_floor_l)
     comment.fit("srgb")
 
     # Every text element must be distinguishable from every other; dict order
@@ -702,9 +752,16 @@ def select_colors(params: ThemeParams) -> Palette:
         "title": family(families["title"], 1, multiplier),
         "punctuation": family(0, 2, multiplier),
         "comment": comment,
-        "hint": band(info["hue"], params.hint_chroma, bg, floor=params.floor_muted),
+        "hint": band(
+            info["hue"],
+            params.hint_chroma,
+            bg,
+            floor=params.floor_muted,
+            direction=direction,
+        ),
         "predictive": ensure_contrast(
-            info.mix(bg, 0.35, space="oklch"), bg, params.floor_subtle
+            info.mix(bg, 0.35, space="oklch"), bg, params.floor_subtle,
+            direction=direction,
         ),
     }
     role_floors = {
@@ -719,15 +776,20 @@ def select_colors(params: ThemeParams) -> Palette:
         bg,
         min_delta=params.min_text_delta,
         default_floor=params.floor_syntax,
+        direction=direction,
     )
     keyword = roles["keyword"]
 
-    text_muted = ensure_contrast(shift_l(text, -0.20), bg, params.floor_muted)
+    text_muted = ensure_contrast(
+        shift_l(text, -0.20 * direction), bg, params.floor_muted, direction=direction
+    )
     text_disabled = text.clone()
-    text_disabled["lightness"] -= 0.32
+    text_disabled["lightness"] -= 0.32 * direction
     text_disabled["chroma"] /= 2
     text_disabled.fit("srgb")
-    text_disabled = ensure_contrast(text_disabled, bg, params.floor_subtle)
+    text_disabled = ensure_contrast(
+        text_disabled, bg, params.floor_subtle, direction=direction
+    )
     line_number = ensure_contrast(
         Color(
             "oklch",
@@ -739,11 +801,18 @@ def select_colors(params: ThemeParams) -> Palette:
         ).fit("srgb"),
         bg,
         params.floor_line_number,
+        direction=direction,
     )
 
     def chrome(delta: float, *, tint: float, chroma: float | None = None) -> Color:
+        # Chrome elevates away from the background: up in dark, down in light.
         return elevate(
-            bg, delta, from_hue=bg_hue, toward_hue=accent_hue, tint=tint, chroma=chroma
+            bg,
+            direction * delta,
+            from_hue=bg_hue,
+            toward_hue=accent_hue,
+            tint=tint,
+            chroma=chroma,
         )
 
     return Palette(
@@ -755,7 +824,7 @@ def select_colors(params: ThemeParams) -> Palette:
         element=chrome(params.element_delta, tint=params.surface_tint),
         element_hover=chrome(params.hover_delta, tint=params.surface_tint),
         element_active=chrome(params.active_delta, tint=params.surface_tint),
-        element_disabled=shift_l(bg, params.element_disabled_delta),
+        element_disabled=shift_l(bg, direction * params.element_disabled_delta),
         border=chrome(
             params.border_delta, tint=params.border_tint, chroma=params.border_chroma
         ),
@@ -768,7 +837,8 @@ def select_colors(params: ThemeParams) -> Palette:
             "oklch", [0.55, params.border_focused_chroma, accent_hue]
         ).fit("srgb"),
         border_selected=Color(
-            "oklch", [0.42, params.border_selected_chroma, accent_hue]
+            "oklch",
+            [0.42 if direction > 0 else 0.68, params.border_selected_chroma, accent_hue],
         ).fit("srgb"),
         border_disabled=chrome(
             params.border_disabled_delta,
@@ -804,8 +874,18 @@ def select_colors(params: ThemeParams) -> Palette:
 # --- style construction ---------------------------------------------------------
 
 
-def build_style(palette: Palette) -> ThemeStyleContent:
-    """Map a filled palette onto every key of the Zed theme schema."""
+def build_style(
+    palette: Palette, *, appearance: AppearanceContent = AppearanceContent.dark
+) -> ThemeStyleContent:
+    """Map a filled palette onto every key of the Zed theme schema.
+
+    `appearance` flips the handful of lightness shifts (bright/dim terminal
+    variants, doc comments) that must move away from the background, and the
+    name-semantic terminal ANSI black/white slots.
+    """
+    direction = (
+        DARK_DIRECTION if appearance is AppearanceContent.dark else LIGHT_DIRECTION
+    )
     bg = palette["bg"]
     accent = palette["accent"]
     fg_editor = palette["fg_editor"]
@@ -827,7 +907,7 @@ def build_style(palette: Palette) -> ThemeStyleContent:
     type_ = palette["type"]
     number = palette["number"]
     comment = palette["comment"]
-    comment_doc = shift_l(comment, 0.06)
+    comment_doc = shift_l(comment, 0.06 * direction)
 
     def status(role: Color) -> tuple[str, str, str]:
         """(foreground, subtle background, border) for a status colour.
@@ -842,20 +922,39 @@ def build_style(palette: Palette) -> ThemeStyleContent:
 
     def bright(c: Color) -> Color:
         b = c.clone()
-        b["lightness"] += 0.06
+        b["lightness"] += 0.06 * direction
         b["chroma"] += 0.01
         return b.fit("srgb")
 
     def dim(c: Color) -> Color:
         d = c.clone()
-        d["lightness"] -= 0.18
+        d["lightness"] -= 0.18 * direction
         d["chroma"] = max(0.0, d["chroma"] - 0.03)
         return d.fit("srgb")
 
-    ansi_white = fg_editor.clone()
-    ansi_white["lightness"] -= 0.10
-    ansi_white["chroma"] = min(ansi_white["chroma"], 0.02)
-    ansi_white.fit("srgb")
+    # A low-chroma neutral one step back from the editor foreground; feeds the
+    # terminal ANSI slot that shares the foreground's side of the bg (white on
+    # dark, black on light).
+    ansi_near_fg = fg_editor.clone()
+    ansi_near_fg["lightness"] -= 0.10 * direction
+    ansi_near_fg["chroma"] = min(ansi_near_fg["chroma"], 0.02)
+    ansi_near_fg.fit("srgb")
+
+    # ANSI black/white slots are name-semantic: black stays on the dark side
+    # and white on the light side regardless of which one the bg occupies.
+    if appearance is AppearanceContent.dark:
+        ansi_black = element
+        ansi_dim_black = surface
+        ansi_white = ansi_near_fg
+        ansi_bright_white = fg_editor
+        ansi_dim_white = text_muted
+    else:
+        ansi_black = ansi_near_fg
+        ansi_dim_black = text_muted
+        ansi_white = element
+        ansi_bright_white = surface
+        ansi_dim_white = element_hover
+    ansi_bright_black = text_disabled
 
     error_hex, error_bg_hex, error_border_hex = status(error)
     warning_hex, warning_bg_hex, warning_border_hex = status(warning)
@@ -1022,24 +1121,24 @@ def build_style(palette: Palette) -> ThemeStyleContent:
         tab_inactive_background=hex_rgba(surface),
         tab_bar_background=hex_rgba(surface),
         terminal_ansi_background=hex_rgba(bg),
-        terminal_ansi_black=hex_rgba(element),
+        terminal_ansi_black=hex_rgba(ansi_black),
         terminal_ansi_blue=hex_rgba(function),
-        terminal_ansi_bright_black=hex_rgba(text_disabled),
+        terminal_ansi_bright_black=hex_rgba(ansi_bright_black),
         terminal_ansi_bright_blue=hex_rgba(bright(function)),
         terminal_ansi_bright_cyan=hex_rgba(bright(type_)),
         terminal_ansi_bright_green=hex_rgba(bright(success)),
         terminal_ansi_bright_magenta=hex_rgba(bright(keyword)),
         terminal_ansi_bright_red=hex_rgba(bright(error)),
-        terminal_ansi_bright_white=hex_rgba(fg_editor),
+        terminal_ansi_bright_white=hex_rgba(ansi_bright_white),
         terminal_ansi_bright_yellow=hex_rgba(bright(warning)),
         terminal_ansi_cyan=hex_rgba(type_),
-        terminal_ansi_dim_black=hex_rgba(surface),
+        terminal_ansi_dim_black=hex_rgba(ansi_dim_black),
         terminal_ansi_dim_blue=hex_rgba(dim(function)),
         terminal_ansi_dim_cyan=hex_rgba(dim(type_)),
         terminal_ansi_dim_green=hex_rgba(dim(success)),
         terminal_ansi_dim_magenta=hex_rgba(dim(keyword)),
         terminal_ansi_dim_red=hex_rgba(dim(error)),
-        terminal_ansi_dim_white=hex_rgba(text_muted),
+        terminal_ansi_dim_white=hex_rgba(ansi_dim_white),
         terminal_ansi_dim_yellow=hex_rgba(dim(warning)),
         terminal_ansi_green=hex_rgba(success),
         terminal_ansi_magenta=hex_rgba(keyword),
@@ -1047,7 +1146,7 @@ def build_style(palette: Palette) -> ThemeStyleContent:
         terminal_ansi_white=hex_rgba(ansi_white),
         terminal_ansi_yellow=hex_rgba(warning),
         terminal_background=hex_rgba(bg),
-        terminal_bright_foreground=hex_rgba(shift_l(fg_editor, 0.03)),
+        terminal_bright_foreground=hex_rgba(shift_l(fg_editor, 0.03 * direction)),
         terminal_dim_foreground=hex_rgba(text_muted),
         terminal_foreground=hex_rgba(fg_editor),
         text=hex_rgba(text),
@@ -1070,8 +1169,13 @@ def build_style(palette: Palette) -> ThemeStyleContent:
 # --- serialisation ---------------------------------------------------------------
 
 
-def theme_family_payload(style: ThemeStyleContent, *, name: str) -> dict[str, object]:
-    """Wrap a style in a single dark-variant theme family, schema pointer included."""
+def theme_family_payload(
+    style: ThemeStyleContent,
+    *,
+    name: str,
+    appearance: AppearanceContent = AppearanceContent.dark,
+) -> dict[str, object]:
+    """Wrap a style in a single-variant theme family, schema pointer included."""
     missing = [
         field.alias or field_name
         for field_name, field in ThemeStyleContent.model_fields.items()
@@ -1084,8 +1188,8 @@ def theme_family_payload(style: ThemeStyleContent, *, name: str) -> dict[str, ob
         name=name,
         themes=[
             ThemeContent(
-                appearance=AppearanceContent.dark,
-                name=f"{name}-dark",
+                appearance=appearance,
+                name=f"{name}-{appearance.value}",
                 style=style,
             )
         ],
@@ -1148,6 +1252,11 @@ class ThemeGenerator(ABC):
         """Single-line provenance comments embedded at the top of the saved JSON."""
         return []
 
+    def theme_appearance(self) -> AppearanceContent:
+        """Which appearance the theme declares; an instance method because some
+        generators compute their side from their inputs."""
+        return AppearanceContent.dark
+
     def save_theme(
         self,
         style: ThemeStyleContent,
@@ -1158,7 +1267,8 @@ class ThemeGenerator(ABC):
         """Save the theme family JSON and refresh the extension.toml Zed reads."""
         directory = THEMES_DIR if directory is None else directory
         text = render_theme_json(
-            theme_family_payload(style, name=name), self.comment_lines()
+            theme_family_payload(style, name=name, appearance=self.theme_appearance()),
+            self.comment_lines(),
         )
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{name}.json"
@@ -1338,6 +1448,13 @@ def list_generators() -> None:
     """List all available theme generators"""
     for generator_name, generator in GENERATORS.items():
         print(f"{generator_name}: {generator.summary}")
+
+
+# Generator modules imported for their side effects (GENERATORS entries and CLI
+# commands). Deliberately last: they import back from this package, which only
+# works once every name above is bound.
+from zed_theme_generator import light as _light  # noqa: F401
+from zed_theme_generator import rainbow as _rainbow  # noqa: F401
 
 
 def main() -> None:
