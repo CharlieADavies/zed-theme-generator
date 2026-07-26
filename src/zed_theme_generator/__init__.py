@@ -402,7 +402,9 @@ def floor_lightness(
     cumulatively crushes its chroma, so every probe is rebuilt from the seed
     coordinates.
     """
-    lightness = bg["lightness"]
+    # Backgrounds lighter than MAX_L (e.g. #ffffff) must still start inside
+    # the walkable range, or the loop exits before its first probe.
+    lightness = min(MAX_L, max(0.0, bg["lightness"]))
     while 0.0 <= lightness <= MAX_L:
         probe = Color("oklch", [lightness, chroma, hue]).fit("srgb")
         if probe.contrast(bg) >= floor:
