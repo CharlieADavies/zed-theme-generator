@@ -579,20 +579,36 @@ def _place_role(
     nearest = min(placed, key=lambda s: seed.delta_e(s, method="ok"))
     away_arc = ((seed["hue"] - nearest.convert("oklch")["hue"] + 180) % 360) - 180
     away = 1.0 if away_arc >= 0 else -1.0
-    hue_offsets = [0.0] + [away * step for step in (6.0, 12.0, 18.0, 24.0, 30.0, 36.0)]
+    # Fan away from the nearest senior first; mirror the arc, then widen it,
+    # only once the preferred side is exhausted — a low-chroma role needs a
+    # wider hue swing for the same OKLab distance.
+    near_steps = (6.0, 12.0, 18.0, 24.0, 30.0, 36.0)
+    far_steps = (48.0, 60.0, 72.0)
+    hue_offsets = (
+        [0.0]
+        + [away * step for step in near_steps]
+        + [-away * step for step in near_steps]
+        + [away * step for step in far_steps]
+        + [-away * step for step in far_steps]
+    )
 
     best: Color | None = None
     best_clearance = -1.0
-    for offset in hue_offsets:
-        hue = (seed["hue"] + offset) % 360
-        for candidate in _ramp_candidates(
-            hue, seed["chroma"], bg, floor, seed["lightness"], prefer_up, direction
-        ):
-            score = clearance(candidate)
-            if score >= min_delta:
-                return candidate
-            if score > best_clearance:
-                best, best_clearance = candidate, score
+    # Chroma escalates only after the seed-chroma search is exhausted: hue and
+    # lightness cannot separate a near-achromatic role from an achromatic
+    # senior in a crowded band, but a small chroma lift always can.
+    for chroma_boost in (0.0, 0.02, 0.04):
+        chroma = seed["chroma"] + chroma_boost
+        for offset in hue_offsets:
+            hue = (seed["hue"] + offset) % 360
+            for candidate in _ramp_candidates(
+                hue, chroma, bg, floor, seed["lightness"], prefer_up, direction
+            ):
+                score = clearance(candidate)
+                if score >= min_delta:
+                    return candidate
+                if score > best_clearance:
+                    best, best_clearance = candidate, score
     assert best is not None
     return best
 
