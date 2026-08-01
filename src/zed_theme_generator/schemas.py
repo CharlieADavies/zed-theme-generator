@@ -28,9 +28,9 @@ from typing import (
     get_type_hints,
 )
 
-from annotated_types import MinLen
+from annotated_types import Ge, Le, MinLen
 from coloraide import Color
-from cyclopts import Parameter
+from cyclopts import Parameter, validators
 from pydantic import AfterValidator, ConfigDict, ValidationError
 
 from zed_theme_generator.gen.zed_theme import (
@@ -112,6 +112,15 @@ type ThemeName = Annotated[
     Parameter(help="Theme (and file) name.", validator=_name_cyclopts),
     AfterValidator(_check_name),
 ]
+# Same dual-consumer pattern for numeric knobs: cyclopts ignores
+# annotated-types metadata (its Number validator fires on CLI/wizard input),
+# pydantic ignores cyclopts validators (Ge/Le fire on the profile path).
+type Percent = Annotated[
+    float, Parameter(validator=validators.Number(gte=0, lte=100)), Ge(0), Le(100)
+]
+type ContrastRatio = Annotated[
+    float, Parameter(validator=validators.Number(gte=1, lte=21)), Ge(1), Le(21)
+]
 
 
 @dataclass(frozen=True)
@@ -133,33 +142,41 @@ class HarmonicInputs:
         Parameter(help="Accent colour; tints UI text and seeds the hue harmony."),
     ]
     minimum_bg_contrast: Annotated[
-        float,
+        ContrastRatio,
         Parameter(
-            help="Minimum WCAG contrast between the background and primary text; "
-            "every other text floor (syntax, muted, subtle, line numbers) "
-            "derives from it."
+            help="Minimum WCAG contrast ratio between the background and primary "
+            "text (1-21; 4.5 = AA, 7 = AAA); every other text floor (syntax, "
+            "muted, subtle, line numbers) derives from it."
         ),
     ] = 10.5
-    target_color_distance: Annotated[
-        float,
+    syntax_spread: Annotated[
+        Percent,
         Parameter(
-            help="Target mean pairwise OKLab distance between syntax token colours."
+            help="How visually spread out the syntax token colours are (0-100; "
+            "50 is the default look, 100 pushes to the gamut edge)."
         ),
-    ] = 0.19
+    ] = 50.0
     harmony_type: Annotated[
         HarmonyType, Parameter(help="coloraide harmony used as the hue-selection hint.")
     ] = "wheel"
-    ui_accent_mix: Annotated[
-        float, Parameter(help="How far UI text is mixed towards the accent (0-1).")
-    ] = 0.55
-    surface_tint: Annotated[
-        float,
+    accent_mix: Annotated[
+        Percent,
+        Parameter(help="How strongly UI text is tinted towards the accent (0-100)."),
+    ] = 55.0
+    surface_blend: Annotated[
+        Percent,
         Parameter(
             help="How far chrome surfaces lean from the background hue towards "
-            "the accent (0-1)."
+            "the accent (0-100)."
         ),
-    ] = 0.3
-    border_tint: Annotated[float, Parameter(help="As surface_tint, for borders.")] = 0.5
+    ] = 30.0
+    border_blend: Annotated[
+        Percent,
+        Parameter(
+            help="How far borders lean from the background hue towards the "
+            "accent (0-100)."
+        ),
+    ] = 50.0
 
 
 @dataclass(frozen=True)
@@ -258,8 +275,25 @@ def hex_rgba(color: Color, alpha: int | None = None) -> str:
 def shift_l(color: Color, delta: float) -> Color:
     """Return an oklch copy of `color` with its lightness shifted by `delta`."""
     c = color.convert("oklch")
-    c["lightness"] = min(MAX_L, max(0.0, c["lightness"] + delta))
+    c["lightness"] = min(MAX_L, max(MIN_L, c["lightness"] + delta))
     return c.fit("srgb")
+
+
+def cursor_color(bg: Color) -> Color:
+    """The caret colour for `bg`: its sRGB inversion, pushed apart when muddy.
+
+    Channel inversion lands opposite the background for extreme backgrounds;
+    for mid-toned ones the inverse sits too close in lightness to read as a
+    caret, so its lightness snaps to the far clamp for the background's side.
+    """
+    srgb = bg.convert("srgb")
+    inverse = Color(
+        "srgb", [1 - srgb["red"], 1 - srgb["green"], 1 - srgb["blue"]]
+    ).convert("oklch")
+    bg_l = bg.convert("oklch")["lightness"]
+    if abs(inverse["lightness"] - bg_l) < 0.4:
+        inverse["lightness"] = MAX_L if bg_l < 0.5 else MIN_L
+    return inverse.fit("srgb")
 
 
 def highlight(
@@ -289,6 +323,8 @@ def build_style(
         DARK_DIRECTION if appearance is AppearanceContent.dark else LIGHT_DIRECTION
     )
     bg = palette["bg"]
+    # All eight players share one caret colour: the background's inversion.
+    inv = cursor_color(bg)
     accent = palette["accent"]
     fg_editor = palette["fg_editor"]
     text = palette["text"]
@@ -495,9 +531,10 @@ def build_style(
         panel_indent_guide_hover=hex_rgba(palette["border"]),
         players=[
             PlayerColorContent(
-                background="#000000ff",
-                cursor="#000000ff",
-                selection="#00000047",
+                background=hex_rgba(inv),
+                cursor=hex_rgba(inv),
+                # Selection stays semi-transparent so selected text reads.
+                selection=hex_rgba(inv, 0x47),
             )
             for _ in range(8)
         ],
@@ -632,7 +669,7 @@ class Profile:
 
     generator: str
     register: bool = False
-    if_exists: Literal["overwrite", "raise"] = "overwrite"
+    if_exists: Literal["overwrite", "raise"] = "raise"
     inputs: dict[str, object] = field(default_factory=dict)
 
 
@@ -675,6 +712,27 @@ def toml_value(value: object) -> str:
     raise TypeError(f"no TOML rendering for {type(value).__name__}")
 
 
+# Input keys retired by the 0-100 knob rescale, mapped to migration hints so
+# old profiles fail loudly with the fix named.
+LEGACY_INPUT_KEYS: dict[str, str] = {
+    "target_color_distance": (
+        "replaced by syntax_spread (0-100); roughly old / 0.0038, capped at 100"
+    ),
+    "ui_accent_mix": (
+        "renamed to accent_mix; the scale is now 0-100, "
+        "multiply the old 0-1 value by 100"
+    ),
+    "surface_tint": (
+        "renamed to surface_blend; the scale is now 0-100, "
+        "multiply the old 0-1 value by 100"
+    ),
+    "border_tint": (
+        "renamed to border_blend; the scale is now 0-100, "
+        "multiply the old 0-1 value by 100"
+    ),
+}
+
+
 def format_validation_error(
     err: ValidationError, *, source: str, prefix: str = ""
 ) -> str:
@@ -682,7 +740,14 @@ def format_validation_error(
     lines = [f"invalid profile ({source}):"]
     for detail in err.errors():
         loc = ".".join(str(part) for part in detail["loc"])
-        lines.append(f"  {prefix}{loc}: {detail['msg']}")
+        message = detail["msg"]
+        # extra="forbid" dataclasses report unknown keys as
+        # unexpected_keyword_argument; plain models as extra_forbidden.
+        if detail["type"] in ("extra_forbidden", "unexpected_keyword_argument"):
+            hint = LEGACY_INPUT_KEYS.get(str(detail["loc"][-1]))
+            if hint is not None:
+                message = f"{message} ({hint})"
+        lines.append(f"  {prefix}{loc}: {message}")
     return "\n".join(lines)
 
 
@@ -758,7 +823,7 @@ def render_template(generator_name: str, spec: type, summary: str) -> str:
         "",
         "# --- run options ---",
         "# register = false          # also copy the theme into ~/.config/zed/themes",
-        '# if_exists = "overwrite"   # overwrite | raise, when registering',
+        '# if_exists = "raise"       # raise | overwrite, when the theme file exists',
         "",
     ]
     return "\n".join(lines)
@@ -769,18 +834,20 @@ def render_profile(
     inputs: Any,
     *,
     register: bool = False,
-    if_exists: str = "overwrite",
+    if_exists: str = "raise",
 ) -> str:
     """Serialise an inputs spec instance as a reusable profile TOML.
 
     Every non-None value is written explicitly — including defaults — so a
-    saved profile reproduces its theme even if defaults change later.
+    saved profile reproduces its theme even if defaults change later. An
+    "overwrite" `if_exists` is always recorded — the sticky opt-in that keeps
+    reruns of this profile overwriting — while the "raise" default is omitted.
     """
     lines = [f'generator = "{generator_name}"']
     if register:
         lines.append("register = true")
-        if if_exists != "overwrite":
-            lines.append(f"if_exists = {toml_value(if_exists)}")
+    if if_exists == "overwrite":
+        lines.append(f"if_exists = {toml_value(if_exists)}")
     lines += ["", "[inputs]"]
     for spec_field in fields(inputs):
         value = getattr(inputs, spec_field.name)

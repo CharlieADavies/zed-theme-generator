@@ -9,7 +9,6 @@ library surface; importing it never builds the CLI app.
 
 from zed_theme_generator.gen.zed_theme import AppearanceContent
 from zed_theme_generator.generator import (
-    FALLBACK_ACCENT_HUE,
     HARMONY_TO_COLORAIDE,
     HUE_BLUE,
     HUE_GREEN,
@@ -48,7 +47,6 @@ from zed_theme_generator.schemas import (
 __all__ = [
     "AUTHOR",
     "DARK_DIRECTION",
-    "FALLBACK_ACCENT_HUE",
     "HARMONY_TO_COLORAIDE",
     "HUE_BLUE",
     "HUE_GREEN",

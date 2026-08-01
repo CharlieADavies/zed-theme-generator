@@ -67,23 +67,28 @@ def test_harmonic_all_defaults(
             "#ffe3f3",  # foreground
             "#ee7ec6",  # accent
             ENTER,  # minimum_bg_contrast
-            ENTER,  # target_color_distance
+            ENTER,  # syntax_spread
             ENTER,  # harmony_type (choice)
-            ENTER,  # ui_accent_mix
-            ENTER,  # surface_tint
-            ENTER,  # border_tint
+            ENTER,  # accent_mix
+            ENTER,  # surface_blend
+            ENTER,  # border_blend
         ],
-        confirms=[True, False, False],  # generate, register, save profile
+        confirms=[True, False],  # generate, register
     )
     _run_wizard(monkeypatch, script)
     script.assert_consumed()
     assert (themes_sandbox / "themes" / "pinkish.json").is_file()
+    # Every run auto-saves its resolved inputs; the default run records no
+    # if_exists opt-in.
+    profile = tomllib.loads((themes_sandbox / "profiles" / "pinkish.toml").read_text())
+    assert profile["generator"] == "harmonic"
+    assert "if_exists" not in profile
 
 
 def test_rainbow_full_run_with_profile(
     themes_sandbox: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Preselected rainbow: variadic colours, status colours, saved profile."""
+    """Preselected rainbow: variadic colours, status colours, auto-saved profile."""
     script = _Script(
         answers=[
             "probe",  # name (generator preselected via --generator)
@@ -100,7 +105,6 @@ def test_rainbow_full_run_with_profile(
             True,  # provide status colours
             True,  # generate
             False,  # register
-            True,  # save profile
         ],
     )
     _run_wizard(monkeypatch, script, ["--generator", "rainbow"])
@@ -135,11 +139,36 @@ def test_invalid_answer_reprompts(
             ENTER,
             ENTER,
         ],
-        confirms=[True, False, False],
+        confirms=[True, False],
     )
     _run_wizard(monkeypatch, script, ["--generator", "harmonic"])
     script.assert_consumed()
     assert (themes_sandbox / "themes" / "corrected.json").is_file()
+
+
+def test_out_of_range_answer_reprompts(
+    themes_sandbox: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An out-of-range knob is rejected by the cyclopts validator and re-asked."""
+    script = _Script(
+        answers=[
+            "ranged",  # name
+            "#0a1022",  # background
+            "#ffe3f3",  # foreground
+            "#ee7ec6",  # accent
+            ENTER,  # minimum_bg_contrast
+            ENTER,  # syntax_spread
+            ENTER,  # harmony_type (choice)
+            "250",  # accent_mix: out of range, re-prompted
+            "55",  # accent_mix: corrected
+            ENTER,  # surface_blend
+            ENTER,  # border_blend
+        ],
+        confirms=[True, False],
+    )
+    _run_wizard(monkeypatch, script, ["--generator", "harmonic"])
+    script.assert_consumed()
+    assert (themes_sandbox / "themes" / "ranged.json").is_file()
 
 
 def test_variadic_too_short_restarts(
@@ -156,7 +185,7 @@ def test_variadic_too_short_restarts(
             ENTER,  # finish: valid
             ENTER,  # background: skip
         ],
-        confirms=[False, True, False, False],  # status, generate, register, save
+        confirms=[False, True, False],  # status, generate, register
     )
     _run_wizard(monkeypatch, script, ["--generator", "rainbow"])
     script.assert_consumed()
@@ -185,6 +214,87 @@ def test_generation_constraint_fails_cleanly(
     with pytest.raises(SystemExit):
         _run_wizard(monkeypatch, script, ["--generator", "harmonic"])
     assert not (themes_sandbox / "themes").exists()
+    # The profile is saved only after a successful generation.
+    assert not (themes_sandbox / "profiles").exists()
+
+
+_HARMONIC_ANSWERS: list[str | None] = [
+    "pinkish",  # name
+    "#0a1022",  # background
+    "#ffe3f3",  # foreground
+    "#ee7ec6",  # accent
+    ENTER,  # minimum_bg_contrast
+    ENTER,  # syntax_spread
+    ENTER,  # harmony_type (choice)
+    ENTER,  # accent_mix
+    ENTER,  # surface_blend
+    ENTER,  # border_blend
+]
+
+
+def test_collision_confirm_overwrites_and_records_opt_in(
+    themes_sandbox: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confirming the overwrite regenerates and records the sticky opt-in."""
+    themes = themes_sandbox / "themes"
+    themes.mkdir()
+    (themes / "pinkish.json").write_text("{}")
+    script = _Script(
+        answers=list(_HARMONIC_ANSWERS),
+        confirms=[True, False, True],  # generate, register, overwrite collision
+    )
+    _run_wizard(monkeypatch, script, ["--generator", "harmonic"])
+    script.assert_consumed()
+    assert (themes / "pinkish.json").read_text() != "{}"
+    profile = tomllib.loads((themes_sandbox / "profiles" / "pinkish.toml").read_text())
+    assert profile["if_exists"] == "overwrite"
+
+
+def test_collision_decline_aborts_untouched(
+    themes_sandbox: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Declining the overwrite aborts cleanly with the original theme intact."""
+    themes = themes_sandbox / "themes"
+    themes.mkdir()
+    (themes / "pinkish.json").write_text("{}")
+    script = _Script(
+        answers=list(_HARMONIC_ANSWERS),
+        confirms=[True, False, False],  # generate, register, overwrite collision
+    )
+    _run_wizard(monkeypatch, script, ["--generator", "harmonic"])
+    script.assert_consumed()
+    assert (themes / "pinkish.json").read_text() == "{}"
+    assert not (themes_sandbox / "profiles").exists()
+
+
+def test_no_save_profile_flag_suppresses_write(themes_sandbox: pathlib.Path) -> None:
+    """--no-save-profile on a typed command skips the profile auto-save."""
+    cli.app(
+        [
+            "harmonic",
+            "--name",
+            "quiet",
+            "--background",
+            "#0a1022",
+            "--foreground",
+            "#ffe3f3",
+            "--accent",
+            "#ee7ec6",
+            "--no-save-profile",
+        ],
+        result_action="return_value",
+        exit_on_error=False,
+    )
+    assert (themes_sandbox / "themes" / "quiet.json").is_file()
+    assert not (themes_sandbox / "profiles").exists()
+
+
+def test_color_swatch_renders(capsys: pytest.CaptureFixture[str]) -> None:
+    """The wizard's colour reference strip prints its heading and chart link."""
+    cli._print_color_swatch()
+    captured = capsys.readouterr()
+    assert "Colour reference" in captured.out
+    assert "https://rich.readthedocs.io/en/stable/appendix/colors.html" in captured.out
 
 
 def test_no_tty_prints_help(

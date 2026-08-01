@@ -1,0 +1,49 @@
+# ztg profile: harmonic generator
+# Derives a full palette from background, foreground and accent colours using
+# a coloraide harmony and WCAG contrast floors
+#
+# Edit, save and quit to generate. Quit without saving to abort.
+
+generator = "harmonic"
+register = true
+
+[inputs]
+
+# Theme (and file) name.
+name = "beautiful"
+
+# Background colour for both editor and UI (any CSS colour string).
+background = "#111016"
+
+# Default editor text colour.
+foreground = "#ffc3ee"
+
+# Accent colour; tints UI text and seeds the hue harmony.
+accent = "#b9fffe"
+
+# Minimum WCAG contrast ratio between the background and primary text (1-21;
+# 4.5 = AA, 7 = AAA); every other text floor (syntax, muted, subtle, line
+# numbers) derives from it.
+minimum_bg_contrast = 10.5
+
+# How visually spread out the syntax token colours are (0-100; 50 is the
+# default look, 100 pushes to the gamut edge).
+# (was target_color_distance = 0.51, past the calibration ceiling; clamped)
+syntax_spread = 100.0
+
+# coloraide harmony used as the hue-selection hint.
+harmony_type = "triadic"
+
+# How strongly UI text is tinted towards the accent (0-100).
+accent_mix = 0.0
+
+# How far chrome surfaces lean from the background hue towards the accent
+# (0-100).
+surface_blend = 0.0
+
+# How far borders lean from the background hue towards the accent (0-100).
+border_blend = 0.0
+
+# --- run options ---
+# register = true          # also copy the theme into ~/.config/zed/themes
+# if_exists = "overwrite"   # overwrite | raise, when registering

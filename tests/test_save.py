@@ -64,3 +64,26 @@ def test_save_theme_round_trip(
     appearance = generator.theme_appearance().value
     assert theme["appearance"] == appearance
     assert theme["name"] == name
+
+
+def test_save_theme_refuses_existing_by_default(tmp_path: pathlib.Path) -> None:
+    """A second save of the same name raises instead of clobbering."""
+    generator = _pinkish()
+    style = generator.build_theme()
+    path = generator.save_theme(style, name="pinkish", directory=tmp_path)
+    before = path.read_text()
+    with pytest.raises(FileExistsError, match="already exists"):
+        generator.save_theme(style, name="pinkish", directory=tmp_path)
+    assert path.read_text() == before
+
+
+def test_save_theme_overwrite_opt_in(tmp_path: pathlib.Path) -> None:
+    """if_exists="overwrite" replaces the existing file."""
+    generator = _pinkish()
+    style = generator.build_theme()
+    first = generator.save_theme(style, name="pinkish", directory=tmp_path)
+    second = generator.save_theme(
+        style, name="pinkish", directory=tmp_path, if_exists="overwrite"
+    )
+    assert first == second
+    assert second.is_file()

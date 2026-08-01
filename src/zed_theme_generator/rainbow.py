@@ -22,7 +22,6 @@ from coloraide import Color
 
 from zed_theme_generator.gen.zed_theme import AppearanceContent, ThemeStyleContent
 from zed_theme_generator.generator import (
-    FALLBACK_ACCENT_HUE,
     HUE_BLUE,
     HUE_GREEN,
     HUE_RED,
@@ -37,6 +36,8 @@ from zed_theme_generator.generator import (
 from zed_theme_generator.schemas import (
     DARK_DIRECTION,
     LIGHT_DIRECTION,
+    MAX_L,
+    MIN_L,
     Palette,
     RainbowInputs,
     build_style,
@@ -44,8 +45,9 @@ from zed_theme_generator.schemas import (
     shift_l,
 )
 
-# Cycle repeats push lightness away from the background by this much per lap
-# around the input list, so a repeat's contrast never drops below its base's.
+# Cycle repeats push lightness away from the background by up to this much per
+# lap around the input list, so a repeat's contrast never drops below its
+# base's; laps split the remaining headroom evenly when the clamp is nearer.
 CYCLE_L_SHIFT = 0.08
 # A status anchor snaps to the nearest input hue within this arc (degrees).
 STATUS_SNAP_TOLERANCE = 30.0
@@ -122,16 +124,22 @@ class RainbowParams:
                 "status_colors must be exactly 4 colours "
                 f"(error, warning, success, info); got {len(status_colors)}"
             )
+        # Input alpha is dropped: "verbatim" means the RGB channels, and the
+        # theme declares itself opaque.
         return cls(
             name=name,
-            colors=tuple(Color(c).convert("oklch") for c in colors),
+            colors=tuple(Color(c).set("alpha", 1).convert("oklch") for c in colors),
             background=(
-                None if background is None else Color(background).convert("oklch")
+                None
+                if background is None
+                else Color(background).set("alpha", 1).convert("oklch")
             ),
             status_colors=(
                 None
                 if status_colors is None
-                else tuple(Color(c).convert("oklch") for c in status_colors)
+                else tuple(
+                    Color(c).set("alpha", 1).convert("oklch") for c in status_colors
+                )
             ),
         )
 
@@ -342,18 +350,83 @@ def build_rainbow_palette(params: RainbowParams) -> Palette:
         bg = select_background(colors, params)
     direction = DARK_DIRECTION if bg["lightness"] < 0.5 else LIGHT_DIRECTION
 
-    accent_hue = (
-        FALLBACK_ACCENT_HUE if colors[0].is_nan("hue") else colors[0]["hue"] % 360
-    )
+    if params.background is not None:
+        # An explicit background is used verbatim, so an unreachable floor
+        # would silently collapse the derived text ramp; refuse it up front.
+        # Auto-selected backgrounds sit at extreme lightness and always clear.
+        achievable = Color("white" if direction > 0 else "black").contrast(bg)
+        if params.floor_primary > achievable:
+            raise ValueError(
+                f"minimum_bg_contrast {params.floor_primary:.2f} is unreachable "
+                f"against this background (maximum achievable {achievable:.2f})"
+            )
+
+    # Every derived hue comes from the inputs: the lead hue is the first
+    # chromatic input's, or the background's when no input has one. With no
+    # chromatic colour anywhere the derived chrome goes fully achromatic —
+    # chroma 0 throughout, so the numeric hue is never visible — and only
+    # the semantically-anchored status colours stay chromatic.
+    lead_hue = next((c["hue"] % 360 for c in colors if not c.is_nan("hue")), None)
+    achromatic = lead_hue is None and bg.is_nan("hue")
+    if lead_hue is not None:
+        accent_hue = lead_hue
+    else:
+        accent_hue = 0.0 if achromatic else bg["hue"] % 360
     bg_hue = accent_hue if bg.is_nan("hue") else bg["hue"] % 360
+
+    def derived_chroma(value: float) -> float:
+        """The chroma a derived role ships with; achromatic themes zero it."""
+        return 0.0 if achromatic else value
+
+    def repeats(base: Color, laps: int) -> list[Color]:
+        """`laps` lightness-shifted repeats of `base`, pairwise hex-distinct.
+
+        Each base's repeats split its remaining lightness headroom evenly
+        (capped at `CYCLE_L_SHIFT` per lap) instead of saturating on the
+        clamp; whenever the headroom cannot separate two repeats at 8-bit
+        precision, the repeat walks whole sRGB steps further from the
+        background. A base already on the background's own side must cross
+        it, so a repeat's contrast can dip below its base's — the dip is
+        bounded (about 0.45 WCAG per crossing, up to ~0.6 when crushed
+        against a gamut corner) and cannot compound across laps. A walk
+        pinned on the corner turns around and takes the corner-adjacent
+        hexes.
+        """
+        headroom = (
+            MAX_L - base["lightness"] if direction > 0 else base["lightness"] - MIN_L
+        )
+        step = min(CYCLE_L_SHIFT, max(0.0, headroom) / laps)
+        seen = {hex_rgba(base)}
+        out: list[Color] = []
+        for lap in range(1, laps + 1):
+            repeat = shift_l(base, direction * step * lap)
+            away = direction
+            while hex_rgba(repeat) in seen:
+                srgb = repeat.convert("srgb")
+                for name in ("red", "green", "blue"):
+                    srgb[name] = min(1.0, max(0.0, srgb[name] + away / 255))
+                bumped = srgb.convert("oklch")
+                if hex_rgba(bumped) == hex_rgba(repeat):
+                    away = -away  # pinned on the gamut corner; turn around
+                    continue
+                repeat = bumped
+            seen.add(hex_rgba(repeat))
+            out.append(repeat)
+        return out
+
+    last = len(ROLE_ORDER) - 1
+    cycled = {
+        i: repeats(base, (last - i) // n)
+        for i, base in enumerate(colors)
+        if (last - i) // n > 0
+    }
 
     def slot(index: int) -> Color:
         """The colour for prominence slot `index`; verbatim on the first lap."""
-        base = colors[index % n]
-        cycle = index // n
+        cycle, base_index = divmod(index, n)
         if cycle == 0:
-            return base.clone()
-        return shift_l(base, direction * CYCLE_L_SHIFT * cycle)
+            return colors[base_index].clone()
+        return cycled[base_index][cycle - 1].clone()
 
     slots = {role: slot(i) for i, role in enumerate(ROLE_ORDER)}
 
@@ -391,10 +464,16 @@ def build_rainbow_palette(params: RainbowParams) -> Palette:
         info_hue = status_hue(HUE_BLUE)
 
     hint = band(
-        info_hue, params.hint_chroma, bg, floor=params.floor_subtle, direction=direction
+        info_hue,
+        derived_chroma(params.hint_chroma),
+        bg,
+        floor=params.floor_subtle,
+        direction=direction,
     )
+    predictive_seed = info.mix(bg, 0.35, space="oklch")
+    predictive_seed["chroma"] = derived_chroma(predictive_seed["chroma"])
     predictive = ensure_contrast(
-        info.mix(bg, 0.35, space="oklch"), bg, params.floor_subtle, direction=direction
+        predictive_seed, bg, params.floor_subtle, direction=direction
     )
 
     def chrome(delta: float, *, tint: float, chroma: float | None = None) -> Color:
@@ -420,7 +499,9 @@ def build_rainbow_palette(params: RainbowParams) -> Palette:
         text_disabled, bg, params.floor_subtle, direction=direction
     )
     line_number = ensure_contrast(
-        Color("oklch", [0.5, params.line_number_chroma, bg_hue]).fit("srgb"),
+        Color("oklch", [0.5, derived_chroma(params.line_number_chroma), bg_hue]).fit(
+            "srgb"
+        ),
         bg,
         params.floor_line_number,
         direction=direction,
@@ -444,28 +525,30 @@ def build_rainbow_palette(params: RainbowParams) -> Palette:
         element_active=chrome(params.active_delta, tint=params.surface_tint),
         element_disabled=shift_l(bg, direction * params.element_disabled_delta),
         border=chrome(
-            params.border_delta, tint=params.border_tint, chroma=params.border_chroma
+            params.border_delta,
+            tint=params.border_tint,
+            chroma=derived_chroma(params.border_chroma),
         ),
         border_variant=chrome(
             params.border_variant_delta,
             tint=params.border_tint,
-            chroma=params.border_chroma,
+            chroma=derived_chroma(params.border_chroma),
         ),
         border_focused=Color(
-            "oklch", [0.55, params.border_focused_chroma, accent_hue]
+            "oklch", [0.55, derived_chroma(params.border_focused_chroma), accent_hue]
         ).fit("srgb"),
         border_selected=Color(
             "oklch",
             [
                 0.42 if direction > 0 else 0.68,
-                params.border_selected_chroma,
+                derived_chroma(params.border_selected_chroma),
                 accent_hue,
             ],
         ).fit("srgb"),
         border_disabled=chrome(
             params.border_disabled_delta,
             tint=params.border_tint,
-            chroma=params.border_chroma,
+            chroma=derived_chroma(params.border_chroma),
         ),
         text_muted=text_muted,
         text_disabled=text_disabled,

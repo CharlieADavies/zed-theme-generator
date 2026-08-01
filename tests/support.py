@@ -22,14 +22,26 @@ from zed_theme_generator import (
     HarmonicPaletteThemeGenerator,
     ThemeGenerator,
     ThemeParams,
+    hex_rgba,
 )
 from zed_theme_generator.gen.zed_theme import ThemeStyleContent
 from zed_theme_generator.light import HarmonicLightPaletteThemeGenerator
 from zed_theme_generator.rainbow import RainbowParams
 
 HEX_RGBA = re.compile(r"^#[0-9a-f]{8}$")
-# Absolute slack for floors re-measured from 8-bit hex output.
-HEX_ROUNDING_TOLERANCE = 0.05
+# Absolute slack for floors re-measured from 8-bit hex output. Derivation:
+# rendering to hex moves every sRGB channel by up to 1/510 (half an 8-bit
+# step) on BOTH the text colour and the background. WCAG contrast is
+# C = (Y_hi + 0.05) / (Y_lo + 0.05), so the worst-case drift is
+#   dC <= (dY_text + C * dY_bg) / (Y_bg + 0.05)   [dark side], and the
+# mirror with the roles swapped on the light side. With dY <= slope/510 and
+# the sRGB linearisation slope (2.4/1.055) * ((v + 0.055)/1.055)^1.4 taken at
+# the lightness where each floor binds, the strategy corners give ~0.11 on
+# the dark side (bg L 0.25, C 10.5) and ~0.133 on the light side (bg L 0.985,
+# where a *dark* text's small Y+0.05 denominator amplifies its own rounding).
+# Sweeping 200k floor-landing pairs over the drawn domain measured 0.1065.
+# 0.14 = the analytic worst case, rounded up.
+HEX_ROUNDING_TOLERANCE = 0.14
 
 # Every Color-valued palette role that renders as text on the editor surface.
 TEXT_ROLES = [
@@ -52,6 +64,26 @@ TEXT_ROLES = [
 def _fit_to_hex(lightness: float, chroma: float, hue: float) -> str:
     color = Color("oklch", [lightness, chroma, hue]).fit("srgb").convert("srgb")
     return color.to_string(hex=True)
+
+
+def _grey_hex(lightness: float) -> str:
+    """A truly achromatic hex (r == g == b) at roughly the given oklch L.
+
+    Fitting a chroma-0 oklch colour to hex can round the three channels
+    apart, leaving a faint chroma; forcing one channel value keeps the drawn
+    background exactly achromatic (oklch hue NaN), which is what the
+    achromatic-affinity properties need.
+    """
+    value = round(Color("oklch", [lightness, 0.0, 0.0]).convert("srgb")["red"] * 255)
+    value = min(255, max(0, value))
+    return f"#{value:02x}{value:02x}{value:02x}"
+
+
+def grey_hex(*, lightness: tuple[float, float]) -> st.SearchStrategy[str]:
+    """An exactly-achromatic sRGB hex drawn by oklch lightness."""
+    return st.builds(
+        _grey_hex, st.floats(min_value=lightness[0], max_value=lightness[1])
+    )
 
 
 def oklch_hex(
@@ -105,9 +137,9 @@ def _harmonic_case(draw: st.DrawFn, *, direction: float) -> HarmonicCase:
         # separated text roles no longer fit.
         minimum_bg_contrast=draw(st.floats(min_value=7.0, max_value=11.0)),
         harmony_type=draw(st.sampled_from(sorted(HARMONY_TO_COLORAIDE))),
-        ui_accent_mix=draw(st.floats(min_value=0.0, max_value=1.0)),
-        surface_tint=draw(st.floats(min_value=0.0, max_value=1.0)),
-        border_tint=draw(st.floats(min_value=0.0, max_value=1.0)),
+        accent_mix=draw(st.floats(min_value=0.0, max_value=100.0)),
+        surface_blend=draw(st.floats(min_value=0.0, max_value=100.0)),
+        border_blend=draw(st.floats(min_value=0.0, max_value=100.0)),
     )
     if dark:
         return HarmonicCase(
@@ -161,13 +193,15 @@ class RainbowCase(NamedTuple):
 def rainbow_cases(
     draw: st.DrawFn, *, explicit_background: bool | None = None
 ) -> RainbowCase:
-    # Input lightness is bounded away from the 8-bit near-black collapse
-    # (hexes below oklch L~0.067 all quantise to black) and the MAX_L clamp,
-    # so CYCLE_L_SHIFT always has room to move cycled repeats off their source.
+    # Input lightness runs right up to the MAX_L clamp (0.985): bases with no
+    # lightness headroom separate their repeats via whole-sRGB steps, and that
+    # path is exercised on purpose. The lower bound stays clear of the 8-bit
+    # near-black collapse (hexes below oklch L~0.067 all quantise to black),
+    # which would pin light-direction walks on the black gamut corner.
     colors = tuple(
         draw(
             st.lists(
-                oklch_hex(lightness=(0.10, 0.92), chroma=(0.0, 0.30)),
+                oklch_hex(lightness=(0.10, 0.985), chroma=(0.0, 0.30)),
                 min_size=2,
                 max_size=8,
             )
@@ -213,6 +247,42 @@ MURK_CASE = RainbowCase(
 
 def dump_style(style: ThemeStyleContent) -> dict[str, object]:
     return style.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+
+def assert_achromatic_hex(color: Color, *, role: str = "") -> None:
+    """The shipped hex is grey: channels within one 8-bit rounding step.
+
+    Fitting an exactly chroma-0 oklch colour to sRGB can round adjacent
+    channels apart by a single step, so a spread of 1 is still `grey`.
+    """
+    rendered = hex_rgba(color)
+    channels = [int(rendered[i : i + 2], 16) for i in (1, 3, 5)]
+    assert max(channels) - min(channels) <= 1, (role, rendered)
+
+
+def assert_cursor_visible(style_json: dict[str, object]) -> None:
+    """All eight players share one caret that reads against the background.
+
+    Pinned behaviour: every player entry is identical; the caret doubles as
+    the player background; the selection is the caret's RGB with a 0x47 alpha
+    byte (semi-transparent, so selected text still reads); and the caret —
+    the background's sRGB inversion, lightness-snapped when the inversion is
+    muddy — clears 4.5:1 WCAG against the background it blinks on. The caret
+    is deliberately NOT required to contrast with the text colours: inverting
+    the background lands it on the text's side of the background by design.
+    """
+    background = Color(str(style_json["background"]))
+    players = style_json["players"]
+    assert isinstance(players, list)
+    assert len(players) == 8
+    assert all(player == players[0] for player in players)
+    player = players[0]
+    assert isinstance(player, dict)
+    cursor = str(player["cursor"])
+    assert player["background"] == cursor
+    assert str(player["selection"]) == f"{cursor[:7]}47"
+    assert cursor != str(style_json["background"])
+    assert Color(cursor).contrast(background) >= 4.5
 
 
 def assert_valid_colors(style_json: dict[str, object]) -> None:

@@ -1,0 +1,30 @@
+# ztg profile: rainbow generator
+# Builds a theme around a weight-ordered colour list used verbatim; the
+# background is taken as given or chosen to clear contrast floors while
+# maximising OKLab distance from the colours
+#
+# Edit, save and quit to generate. Quit without saving to abort.
+
+generator = "rainbow"
+
+[inputs]
+
+# Theme (and file) name.
+name = "lego"
+
+# Two or more CSS colour strings, most significant first; they appear verbatim
+# in the most prominent theme roles.
+colors = ["green","blue",  "red", "yellow"]
+
+# Background colour for both editor and UI, used verbatim; when omitted the
+# background is chosen to clear contrast floors and maximise OKLab distance to
+# the colours.
+background = "#0a1022"
+
+# Exactly four CSS colour strings (error, warning, success, info) used
+# verbatim; derived from the hue anchors when omitted.
+status_colors = ["#ff3860", "#ffdd57", "#23d160", "#209cee"]
+
+# --- run options ---
+# register = false          # also copy the theme into ~/.config/zed/themes
+# if_exists = "overwrite"   # overwrite | raise, when registering

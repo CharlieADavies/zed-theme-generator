@@ -125,6 +125,43 @@ def test_unknown_generator_fails_before_editor(
         edit_profile("sparkle")
 
 
+def test_theme_collision_banner_then_overwrite_opt_in(
+    themes_sandbox: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing theme re-opens the editor; adding the opt-in overwrites it."""
+    (themes_sandbox / "themes").mkdir(parents=True)
+    (themes_sandbox / "themes" / "taken.json").write_text("{}")
+    counter = themes_sandbox / "count"
+    banner = themes_sandbox / "banner"
+    _install_editor(
+        themes_sandbox,
+        monkeypatch,
+        f"""\
+        counter = pathlib.Path({str(counter)!r})
+        n = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(n + 1))
+        profile = (
+            'generator = "rainbow"\\n[inputs]\\nname = "taken"\\n'
+            'colors = ["#ff004d", "#ffa300"]\\n'
+        )
+        if n == 0:
+            path.write_text(profile)
+        else:
+            pathlib.Path({str(banner)!r}).write_text(path.read_text())
+            path.write_text('if_exists = "overwrite"\\n' + profile)
+        """,
+    )
+    profile_path = edit_profile("rainbow")
+    assert counter.read_text() == "2"
+    banner_text = banner.read_text()
+    assert banner_text.startswith("#!! ")
+    assert "taken.json already exists" in banner_text
+    assert 'add if_exists = "overwrite" or change the name' in banner_text
+    assert profile_path == themes_sandbox / "profiles" / "taken.toml"
+    assert 'if_exists = "overwrite"' in profile_path.read_text()
+    assert (themes_sandbox / "themes" / "taken.json").read_text() != "{}"
+
+
 def test_editor_mode_dispatch(
     themes_sandbox: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

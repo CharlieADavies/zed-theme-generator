@@ -11,8 +11,9 @@ import pathlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from functools import cached_property
 from itertools import combinations
-from typing import Any, ClassVar, Self, cast, override
+from typing import Any, ClassVar, Literal, Self, cast, override
 
 from coloraide import Color
 
@@ -47,7 +48,6 @@ EXTENSION_REPOSITORY = "https://github.com/CharlieADavies/zed-theme-generator"
 CONTRAST_STEP = 0.01
 
 STATUS_ANCHOR_TOLERANCE = 15.0  # status hues must stay recognisable (red error etc.)
-FALLBACK_ACCENT_HUE = 343.0  # pink, for achromatic accent inputs
 
 # oklch hue anchors for status colours with fixed semantics (red error etc.)
 HUE_RED = 25.0
@@ -65,6 +65,11 @@ LADDER_RUNGS = 4
 # muddy brown/olive midpoint of the wheel.
 TINT_ARC_MAX = 80.0
 
+# Calibration ceiling for the user-facing syntax_spread knob (0-100): 100 maps
+# to this mean pairwise OKLab token distance, so 50 lands exactly on the 0.19
+# historical default.
+SYNTAX_SPREAD_MAX = 0.38
+
 HARMONY_TO_COLORAIDE: dict[HarmonyType, str] = {
     "monochromatic": "mono",
     "complementary": "complement",
@@ -80,6 +85,8 @@ HARMONY_TO_COLORAIDE: dict[HarmonyType, str] = {
 # movable syntax role draws from, per harmony hint. Family 0 is the accent
 # itself (keyword/operator/punctuation). Rung>=1 roles (title) must sit >=2
 # families from 0: ladder chroma fades up-rung, so hue-only separation weakens.
+# Mono is the exception: every role stays within MONO_FAMILIES, so seeds
+# collide on hue and the text-role separation pass differentiates by lightness.
 FAMILY_MAPS: dict[str, dict[str, int]] = {
     "wheel": {"number": 2, "type": 7, "function": 8, "title": 10, "property": 11},
     "complement": {"number": 6, "type": 7, "function": 5, "title": 10, "property": 1},
@@ -88,8 +95,14 @@ FAMILY_MAPS: dict[str, dict[str, int]] = {
     "triad": {"number": 4, "type": 3, "function": 8, "title": 9, "property": 11},
     "square": {"number": 3, "type": 6, "function": 9, "title": 10, "property": 11},
     "rectangle": {"number": 2, "type": 6, "function": 8, "title": 10, "property": 4},
-    "mono": {"number": 2, "type": 7, "function": 8, "title": 10, "property": 11},
+    "mono": {"number": 0, "type": 11, "function": 1, "title": 11, "property": 1},
 }
+
+# Monochromatic themes seed within +/-30 degrees of the accent: the accent's
+# own family and its immediate wheel neighbours. The separation fan may still
+# swing a colliding token further out when nothing nearer clears
+# `min_text_delta` — distinguishability outranks hue purity.
+MONO_FAMILIES = frozenset({0, 1, WHEEL_COUNT - 1})
 
 # --- generation parameters ----------------------------------------------------
 
@@ -98,10 +111,12 @@ FAMILY_MAPS: dict[str, dict[str, int]] = {
 class ThemeParams:
     """Everything a theme generation depends on.
 
-    The first block mirrors the CLI; the master knobs below it stay on their
-    defaults unless constructed directly. Every derived value the pipeline
-    reads is a property computed from these few masters, so retuning the theme
-    means moving one number, not eight.
+    Every field is in internal units (0-1 mix fractions, OKLab distances);
+    `from_strings` is the boundary where the user-scale inputs (0-100 knobs,
+    CSS colour strings) are converted. The master knobs at the bottom stay on
+    their defaults unless constructed directly. Every derived value the
+    pipeline reads is a property computed from these few masters, so retuning
+    the theme means moving one number, not eight.
     """
 
     name: str
@@ -138,24 +153,30 @@ class ThemeParams:
         foreground: str,
         accent: str,
         minimum_bg_contrast: float = 10.5,
-        target_color_distance: float = 0.19,
+        syntax_spread: float = 50.0,
         harmony_type: HarmonyType = "wheel",
-        ui_accent_mix: float = 0.55,
-        surface_tint: float = 0.3,
-        border_tint: float = 0.5,
+        accent_mix: float = 55.0,
+        surface_blend: float = 30.0,
+        border_blend: float = 50.0,
     ) -> Self:
-        """Resolve raw CLI strings into generation parameters."""
+        """Resolve user-scale inputs (CSS strings, 0-100 knobs) into parameters.
+
+        The 0-100 knobs become 0-1 mix fractions, and syntax_spread maps onto
+        the calibrated OKLab distance range [0, SYNTAX_SPREAD_MAX].
+        """
+        # Input alpha is dropped: the theme declares itself opaque, so only
+        # the RGB channels of each input colour participate.
         return cls(
             name=name,
-            background=Color(background),
-            foreground=Color(foreground),
-            accent=Color(accent),
+            background=Color(background).set("alpha", 1),
+            foreground=Color(foreground).set("alpha", 1),
+            accent=Color(accent).set("alpha", 1),
             minimum_bg_contrast=minimum_bg_contrast,
-            target_color_distance=target_color_distance,
+            target_color_distance=syntax_spread / 100 * SYNTAX_SPREAD_MAX,
             harmony=HARMONY_TO_COLORAIDE[harmony_type],
-            ui_accent_mix=ui_accent_mix,
-            surface_tint=surface_tint,
-            border_tint=border_tint,
+            ui_accent_mix=accent_mix / 100,
+            surface_tint=surface_blend / 100,
+            border_tint=border_blend / 100,
         )
 
     # WCAG 2.1 contrast floors against the background. floor_syntax is
@@ -284,10 +305,11 @@ def hue_towards(from_hue: float, to_hue: float, amount: float) -> float:
 
     The arc is capped at `TINT_ARC_MAX` degrees: leaning is a cast, and a hue
     should keep its family even when the target is nearly complementary.
+    `amount` is clamped to [0, 1] so an out-of-range knob cannot defeat the cap.
     """
     delta = ((to_hue - from_hue + 180) % 360) - 180
     delta = max(-TINT_ARC_MAX, min(TINT_ARC_MAX, delta))
-    return (from_hue + delta * amount) % 360
+    return (from_hue + delta * min(1.0, max(0.0, amount))) % 360
 
 
 def ensure_contrast(
@@ -303,7 +325,7 @@ def ensure_contrast(
         if c.contrast(bg) >= floor:
             break
         lightness = c["lightness"] + direction * CONTRAST_STEP
-        if not 0.0 <= lightness <= MAX_L:
+        if not MIN_L <= lightness <= MAX_L:
             break
         c["lightness"] = lightness
         c.fit("srgb")
@@ -324,15 +346,15 @@ def floor_lightness(
     cumulatively crushes its chroma, so every probe is rebuilt from the seed
     coordinates.
     """
-    # Backgrounds lighter than MAX_L (e.g. #ffffff) must still start inside
-    # the walkable range, or the loop exits before its first probe.
-    lightness = min(MAX_L, max(0.0, bg["lightness"]))
-    while 0.0 <= lightness <= MAX_L:
+    # Backgrounds outside the [MIN_L, MAX_L] clamp (e.g. #ffffff) must still
+    # start inside the walkable range, or the loop exits before its first probe.
+    lightness = min(MAX_L, max(MIN_L, bg["lightness"]))
+    while MIN_L <= lightness <= MAX_L:
         probe = Color("oklch", [lightness, chroma, hue]).fit("srgb")
         if probe.contrast(bg) >= floor:
             return lightness
         lightness += direction * CONTRAST_STEP
-    return MAX_L if direction > 0 else 0.0
+    return MAX_L if direction > 0 else MIN_L
 
 
 def band(
@@ -370,7 +392,11 @@ def ladder(
     base = band(hue, chroma, bg, floor=floor, direction=direction)
     capped = top.convert("oklch")
     capped["hue"] = hue
-    return Color.steps([base, capped], steps=rungs, space="oklch")
+    # Fit every rung: interpolation leaves the gamut, and guarantees must be
+    # measured on the colour that ships.
+    return [
+        c.fit("srgb") for c in Color.steps([base, capped], steps=rungs, space="oklch")
+    ]
 
 
 def nearest_wheel_hue(
@@ -457,8 +483,10 @@ def separate_text_roles(
     """
     placed: dict[str, Color] = {}
     for index, (name, seed) in enumerate(roles.items()):
+        # Seeds are fitted on entry: clearance and contrast are only
+        # meaningful when measured on the colour that ships.
         placed[name] = _place_role(
-            seed.convert("oklch"),
+            seed.convert("oklch").fit("srgb"),
             placed.values(),
             bg,
             floor=floors.get(name, default_floor),
@@ -541,18 +569,45 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
         )
     bg["chroma"] = min(bg["chroma"], params.bg_chroma_cap)
     bg.fit("srgb")
-    bg_hue = FALLBACK_ACCENT_HUE if bg.is_nan("hue") else bg["hue"]
 
+    # Contrast floors are promises; an unreachable floor would silently
+    # collapse every text ramp onto the gamut edge, so refuse it up front.
+    achievable = Color("white" if direction > 0 else "black").contrast(bg)
+    if params.floor_primary > achievable:
+        raise ValueError(
+            f"minimum_bg_contrast {params.floor_primary:.2f} is unreachable "
+            f"against this background (maximum achievable {achievable:.2f})"
+        )
+
+    # Every hue derives from the inputs. An achromatic accent borrows the
+    # background's hue; when the background is achromatic too there is no
+    # input hue at all, so the theme goes fully achromatic: every derived
+    # non-status colour keeps chroma 0 (only the semantically-anchored status
+    # colours stay chromatic). The wheel math still needs numbers, so hues
+    # live in plain floats — coloraide nulls the hue channel of any chroma-0
+    # colour, and NaN would otherwise leak through the arithmetic.
     accent = params.accent.convert("oklch")
-    if accent.is_nan("hue"):
-        accent["hue"] = FALLBACK_ACCENT_HUE
-    accent_chroma = min(
-        max(accent["chroma"], params.syntax_chroma), params.accent_chroma_cap
-    )
+    achromatic = accent.is_nan("hue") and bg.is_nan("hue")
+    if achromatic:
+        accent_hue = 0.0  # never visible: every derived chroma is zero
+        accent_chroma = 0.0
+    else:
+        accent_hue = (bg["hue"] if accent.is_nan("hue") else accent["hue"]) % 360
+        accent_chroma = min(
+            max(accent["chroma"], params.syntax_chroma), params.accent_chroma_cap
+        )
     accent = band(
-        accent["hue"], accent_chroma, bg, floor=params.floor_syntax, direction=direction
+        accent_hue, accent_chroma, bg, floor=params.floor_syntax, direction=direction
     )
-    accent_hue = accent["hue"]
+    if not achromatic:
+        accent_hue = accent["hue"]
+    # An achromatic background leans on the accent's hue: chrome and borders
+    # must carry the accent's cast.
+    bg_hue = accent_hue if bg.is_nan("hue") else bg["hue"]
+
+    def derived_chroma(value: float) -> float:
+        """The chroma a derived role ships with; achromatic themes zero it."""
+        return 0.0 if achromatic else value
 
     # The input foreground keeps its own lightness; minimum_bg_contrast is a
     # floor, not a target, so brightness beyond it comes from the input colour.
@@ -574,9 +629,21 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
     text = ensure_contrast(text, bg, params.floor_primary, direction=direction)
 
     # Harmony families: full wheel colours from the accent carry its chroma
-    # into every family.
+    # into every family. A grey accent's harmony nulls every hue, so the
+    # achromatic wheel is laid out numerically (its chroma is zero anyway).
     wheel = accent.harmony("wheel", space="oklch", count=WHEEL_COUNT)
-    wheel_hues = [w["hue"] % 360 for w in wheel]
+    if achromatic:
+        wheel_hues = [
+            (accent_hue + i * 360 / WHEEL_COUNT) % 360 for i in range(WHEEL_COUNT)
+        ]
+    else:
+        wheel_hues = [w["hue"] % 360 for w in wheel]
+
+    # Ladder rungs interpolate towards the foreground; in an achromatic theme
+    # the top must not re-introduce the input foreground's chroma at the
+    # (numerically laid out, meaningless) family hues.
+    ladder_top = fg_editor.clone()
+    ladder_top["chroma"] = derived_chroma(ladder_top["chroma"])
 
     def family(index: int, rung: int, multiplier: float = 1.0) -> Color:
         hue = hue_towards(wheel_hues[index], bg_hue, params.syntax_cast)
@@ -591,14 +658,20 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
             hue,
             chroma,
             bg=bg,
-            top=fg_editor,
+            top=ladder_top,
             floor=params.floor_syntax,
             direction=direction,
         )[rung]
 
     def status_band(anchor: float) -> Color:
-        # Status colours: hue-anchored tightly so semantics stay legible.
-        hue = nearest_wheel_hue(wheel_hues, anchor, STATUS_ANCHOR_TOLERANCE)
+        # Status colours: hue-anchored tightly so semantics stay legible. An
+        # achromatic theme has no meaningful wheel, so the pure anchors hold —
+        # a grayscale theme still reads red errors and blue info.
+        hue = (
+            anchor
+            if achromatic
+            else nearest_wheel_hue(wheel_hues, anchor, STATUS_ANCHOR_TOLERANCE)
+        )
         return band(
             hue,
             params.syntax_chroma,
@@ -620,11 +693,17 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
 
         Strings arise from the harmony like every other role: of the wheel
         families no other role draws from, the one whose colour sits furthest
-        (OKLab) from the keyword colour.
+        (OKLab) from the keyword colour. Mono never leaves its near families,
+        so strings pick the farthest of the accent's neighbours instead.
         """
         keyword = family(0, 0, multiplier)
+        string_candidates = (
+            sorted(MONO_FAMILIES - {0})
+            if params.harmony == "mono"
+            else [i for i in range(WHEEL_COUNT) if i not in {0, *families.values()}]
+        )
         string_family = max(
-            (i for i in range(WHEEL_COUNT) if i not in {0, *families.values()}),
+            string_candidates,
             key=lambda i: family(i, 0, multiplier).delta_e(keyword, method="ok"),
         )
         return {
@@ -654,11 +733,14 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
         )
         toks = tokens(multiplier)
 
-    # Comment: a mono-harmony shade of the accent, muted and bg-cast.
+    # Comment: a mono-harmony shade of the accent, muted and bg-cast. A grey
+    # accent's shades have no hue to cast (and NaN must not enter the hue
+    # arithmetic), so the achromatic branch leaves the grey shade alone.
     mono = accent.harmony("mono", space="oklch")
     comment = mono[2].clone()
     comment["chroma"] = min(comment["chroma"], params.comment_chroma_cap)
-    comment["hue"] = hue_towards(comment["hue"], bg_hue, params.syntax_cast)
+    if not achromatic:
+        comment["hue"] = hue_towards(comment["hue"], bg_hue, params.syntax_cast)
     # On a light background the floor lightness is a ceiling, not a floor.
     comment_floor_l = floor_lightness(
         comment["hue"], comment["chroma"], bg, params.floor_muted, direction=direction
@@ -669,6 +751,9 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
         comment["lightness"] = min(comment["lightness"], comment_floor_l)
     comment.fit("srgb")
 
+    predictive_seed = info.mix(bg, 0.35, space="oklch")
+    predictive_seed["chroma"] = derived_chroma(predictive_seed["chroma"])
+
     # Every text element must be distinguishable from every other; dict order
     # is seniority — separation only ever moves the junior role of a pair.
     seeds: dict[str, Color] = {
@@ -678,15 +763,17 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
         "title": family(families["title"], 1, multiplier),
         "punctuation": family(0, 2, multiplier),
         "comment": comment,
+        # Hint and predictive lean on the info hue but are not status
+        # colours themselves: in an achromatic theme they ship grey.
         "hint": band(
             info["hue"],
-            params.hint_chroma,
+            derived_chroma(params.hint_chroma),
             bg,
             floor=params.floor_muted,
             direction=direction,
         ),
         "predictive": ensure_contrast(
-            info.mix(bg, 0.35, space="oklch"),
+            predictive_seed,
             bg,
             params.floor_subtle,
             direction=direction,
@@ -723,7 +810,7 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
             "oklch",
             [
                 0.5,
-                params.line_number_chroma,
+                derived_chroma(params.line_number_chroma),
                 hue_towards(bg_hue, accent_hue, params.line_number_tint),
             ],
         ).fit("srgb"),
@@ -754,28 +841,30 @@ def select_colors(params: ThemeParams, *, direction: float = DARK_DIRECTION) -> 
         element_active=chrome(params.active_delta, tint=params.surface_tint),
         element_disabled=shift_l(bg, direction * params.element_disabled_delta),
         border=chrome(
-            params.border_delta, tint=params.border_tint, chroma=params.border_chroma
+            params.border_delta,
+            tint=params.border_tint,
+            chroma=derived_chroma(params.border_chroma),
         ),
         border_variant=chrome(
             params.border_variant_delta,
             tint=params.border_tint,
-            chroma=params.border_chroma,
+            chroma=derived_chroma(params.border_chroma),
         ),
         border_focused=Color(
-            "oklch", [0.55, params.border_focused_chroma, accent_hue]
+            "oklch", [0.55, derived_chroma(params.border_focused_chroma), accent_hue]
         ).fit("srgb"),
         border_selected=Color(
             "oklch",
             [
                 0.42 if direction > 0 else 0.68,
-                params.border_selected_chroma,
+                derived_chroma(params.border_selected_chroma),
                 accent_hue,
             ],
         ).fit("srgb"),
         border_disabled=chrome(
             params.border_disabled_delta,
             tint=params.border_tint,
-            chroma=params.border_chroma,
+            chroma=derived_chroma(params.border_chroma),
         ),
         text_muted=text_muted,
         text_disabled=text_disabled,
@@ -829,6 +918,14 @@ def palette_comment(palette: Palette) -> str:
 # --- generators --------------------------------------------------------------
 
 
+def existing_theme_error(path: pathlib.Path) -> FileExistsError:
+    """The uniform refusal for writing over an existing theme file."""
+    return FileExistsError(
+        f"{path} already exists (pass --if-exists overwrite, "
+        'add if_exists = "overwrite" to the profile, or pick a new name)'
+    )
+
+
 class ThemeGenerator(ABC):
     """Base class for theme generators registered in `GENERATORS`.
 
@@ -866,15 +963,21 @@ class ThemeGenerator(ABC):
         *,
         name: str,
         directory: pathlib.Path | None = None,
+        if_exists: Literal["overwrite", "raise"] = "raise",
     ) -> pathlib.Path:
-        """Save the theme family JSON and refresh the extension.toml Zed reads."""
+        """Save the theme family JSON and refresh the extension.toml Zed reads.
+
+        An existing file is never clobbered unless `if_exists` is "overwrite".
+        """
         directory = THEMES_DIR if directory is None else directory
+        path = directory / f"{name}.json"
+        if path.exists() and if_exists == "raise":
+            raise existing_theme_error(path)
         text = render_theme_json(
             theme_family_payload(style, name=name, appearance=self.theme_appearance()),
             self.comment_lines(),
         )
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{name}.json"
         path.write_text(text)
         if directory == THEMES_DIR:
             write_extension_toml()
@@ -900,15 +1003,20 @@ class HarmonicPaletteThemeGenerator(ThemeGenerator):
         """Build a generator from a validated inputs spec."""
         return cls(ThemeParams.from_strings(**asdict(inputs)))
 
+    @cached_property
+    def palette(self) -> Palette:
+        """The resolved palette, computed once; every hook below reads it."""
+        return select_colors(self.params)
+
     @override
     def build_theme(self) -> ThemeStyleContent:
-        return build_style(select_colors(self.params))
+        return build_style(self.palette)
 
     @override
     def comment_lines(self) -> list[str]:
         return [
             params_comment(self.params),
-            palette_comment(select_colors(self.params)),
+            palette_comment(self.palette),
         ]
 
 

@@ -12,6 +12,7 @@ dependencies = [
     "coloraide>=8.10",
     "cyclopts>=4.22.2",
     "pydantic>=2.13.4",
+    "rich>=15.0.0",
 ]
 
 [tool.pyrefly]

@@ -23,9 +23,11 @@ from cyclopts import (
 )
 from cyclopts.exceptions import CycloptsError
 from pydantic import TypeAdapter, ValidationError
+from rich.color import Color as RichColor
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
+from rich.text import Text
 
 from zed_theme_generator.generator import (
     PROFILES_DIR,
@@ -33,6 +35,7 @@ from zed_theme_generator.generator import (
     ZED_THEMES_DIR,
     HarmonicPaletteThemeGenerator,
     ThemeGenerator,
+    existing_theme_error,
 )
 from zed_theme_generator.light import HarmonicLightPaletteThemeGenerator
 from zed_theme_generator.rainbow import RainbowThemeGenerator
@@ -41,6 +44,7 @@ from zed_theme_generator.schemas import (
     Profile,
     ProfileError,
     RainbowInputs,
+    _check_name,
     format_validation_error,
     render_profile,
     render_template,
@@ -48,24 +52,82 @@ from zed_theme_generator.schemas import (
 
 app = App(name="ztg")
 
+
+def _build_registry(
+    *classes: type[ThemeGenerator],
+) -> dict[str, type[ThemeGenerator]]:
+    """Key generators by name, refusing duplicates rather than last-winning."""
+    registry: dict[str, type[ThemeGenerator]] = {}
+    for cls in classes:
+        if cls.generator_name in registry:
+            raise ValueError(
+                f"duplicate generator name {cls.generator_name!r}: "
+                f"{registry[cls.generator_name].__name__} and {cls.__name__}"
+            )
+        registry[cls.generator_name] = cls
+    return registry
+
+
 # Every generator the CLI can drive, keyed by generator name (== command
 # name); the wizard, file mode, and list-generators all read this registry.
-GENERATORS: dict[str, type[ThemeGenerator]] = {
-    cls.generator_name: cls
-    for cls in (
-        HarmonicPaletteThemeGenerator,
-        HarmonicLightPaletteThemeGenerator,
-        RainbowThemeGenerator,
-    )
-}
+GENERATORS: dict[str, type[ThemeGenerator]] = _build_registry(
+    HarmonicPaletteThemeGenerator,
+    HarmonicLightPaletteThemeGenerator,
+    RainbowThemeGenerator,
+)
 
 type _Register = Annotated[
     bool, Parameter(help="Also copy the generated theme into ~/.config/zed/themes.")
 ]
 type _IfExists = Annotated[
     Literal["overwrite", "raise"],
-    Parameter(help="What to do when registering over an existing theme file."),
+    Parameter(
+        help="What to do when saving the theme file or registering over an "
+        "existing one."
+    ),
 ]
+type _SaveProfile = Annotated[
+    bool,
+    Parameter(
+        help="Save the resolved inputs to profiles/<name>.toml "
+        "(--no-save-profile to skip)."
+    ),
+]
+
+
+def _theme_destinations(
+    name: str, directory: pathlib.Path, register: bool
+) -> list[pathlib.Path]:
+    """Every path a run for `name` would write a theme file to."""
+    destinations = [directory / f"{name}.json"]
+    if register:
+        destinations.append(ZED_THEMES_DIR / f"{name}.json")
+    return destinations
+
+
+def save_profile(
+    generator_name: str,
+    inputs: Any,
+    *,
+    register: bool,
+    if_exists: Literal["overwrite", "raise"],
+) -> pathlib.Path:
+    """Write the resolved inputs to profiles/<name>.toml, overwriting silently.
+
+    Profiles are input records: every run re-records what produced its theme,
+    so a rerun must never collide with its own previous save.
+    """
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    path = PROFILES_DIR / f"{inputs.name}.toml"
+    path.write_text(
+        render_profile(generator_name, inputs, register=register, if_exists=if_exists)
+    )
+    print(f"Saved profile {path}")
+    return path
+
+
+# run_generator's `save_profile` flag shadows the helper inside its body.
+_save_profile = save_profile
 
 
 def run_generator(
@@ -73,19 +135,35 @@ def run_generator(
     inputs: Any,
     *,
     register: bool = False,
-    if_exists: Literal["overwrite", "raise"] = "overwrite",
+    if_exists: Literal["overwrite", "raise"] = "raise",
     directory: pathlib.Path | None = None,
+    save_profile: bool = True,
 ) -> pathlib.Path:
     """Build, save, and optionally register a theme from a validated inputs spec.
 
     The shared runner behind every mode: typed commands, profile files, the
-    editor, and the wizard all end up here.
+    editor, and the wizard all end up here. Ordering is deliberate: every
+    destination is pre-flighted before anything is written, so a collision
+    cannot leave a half-done run behind, and the profile is saved only after
+    the theme, so a generation failure leaves nothing behind.
     """
     generator = cls.from_inputs(inputs)
+    if if_exists == "raise":
+        theme_dir = THEMES_DIR if directory is None else directory
+        for destination in _theme_destinations(inputs.name, theme_dir, register):
+            if destination.exists():
+                raise existing_theme_error(destination)
     path = generator.save_theme(
-        generator.build_theme(), name=inputs.name, directory=directory
+        generator.build_theme(),
+        name=inputs.name,
+        directory=directory,
+        if_exists=if_exists,
     )
     print(f"Wrote {path}")
+    if save_profile:
+        _save_profile(
+            cls.generator_name, inputs, register=register, if_exists=if_exists
+        )
     if register:
         register_themes(inputs.name, if_exists)
     return path
@@ -96,11 +174,16 @@ def harmonic(
     params: Annotated[HarmonicInputs, Parameter(name="*")],
     *,
     register: _Register = False,
-    if_exists: _IfExists = "overwrite",
+    if_exists: _IfExists = "raise",
+    save_profile: _SaveProfile = True,
 ) -> None:
     """Generate a dark Zed theme using a harmonic colour palette."""
     run_generator(
-        HarmonicPaletteThemeGenerator, params, register=register, if_exists=if_exists
+        HarmonicPaletteThemeGenerator,
+        params,
+        register=register,
+        if_exists=if_exists,
+        save_profile=save_profile,
     )
 
 
@@ -109,7 +192,8 @@ def harmonic_light(
     params: Annotated[HarmonicInputs, Parameter(name="*")],
     *,
     register: _Register = False,
-    if_exists: _IfExists = "overwrite",
+    if_exists: _IfExists = "raise",
+    save_profile: _SaveProfile = True,
 ) -> None:
     """Generate a light Zed theme using a harmonic colour palette.
 
@@ -120,6 +204,7 @@ def harmonic_light(
         params,
         register=register,
         if_exists=if_exists,
+        save_profile=save_profile,
     )
 
 
@@ -128,13 +213,20 @@ def rainbow(
     params: Annotated[RainbowInputs, Parameter(name="*")],
     *,
     register: _Register = False,
-    if_exists: _IfExists = "overwrite",
+    if_exists: _IfExists = "raise",
+    save_profile: _SaveProfile = True,
 ) -> None:
     """Generate a Zed theme from a weight-ordered colour list used verbatim.
 
     The theme's appearance follows the background's lightness.
     """
-    run_generator(RainbowThemeGenerator, params, register=register, if_exists=if_exists)
+    run_generator(
+        RainbowThemeGenerator,
+        params,
+        register=register,
+        if_exists=if_exists,
+        save_profile=save_profile,
+    )
 
 
 @app.command
@@ -142,6 +234,7 @@ def register_themes(
     name: str, if_exists: Literal["overwrite", "raise"] = "raise"
 ) -> None:
     """Registers the theme in ~/.config/zed/themes"""
+    _check_name(name)
     source = THEMES_DIR / f"{name}.json"
     if not source.exists():
         raise FileNotFoundError(f"No generated theme at {source}; run generate first")
@@ -218,15 +311,27 @@ def parse_profile_document(doc: Mapping[str, object], *, source: str) -> ParsedP
 def run_profile_path(
     path: pathlib.Path, *, directory: pathlib.Path | None = None
 ) -> pathlib.Path:
-    """Generate a theme from a profile TOML file."""
+    """Generate a theme from a profile TOML file.
+
+    On success the source file is copied verbatim into profiles/ — comments
+    intact — unless it already lives there: a profile inside profiles/ is
+    never re-rendered or clobbered.
+    """
     parsed = parse_profile_document(load_profile_path(path), source=str(path))
-    return run_generator(
+    theme_path = run_generator(
         parsed.generator_cls,
         parsed.inputs,
         register=parsed.register,
         if_exists=parsed.if_exists,
         directory=directory,
+        save_profile=False,
     )
+    if not path.resolve().is_relative_to(PROFILES_DIR.resolve()):
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        destination = PROFILES_DIR / f"{parsed.inputs.name}.toml"
+        shutil.copyfile(path, destination)
+        print(f"Saved profile {destination}")
+    return theme_path
 
 
 # --- default entry: wizard, -f, --editor ---------------------------------------
@@ -259,7 +364,7 @@ def default_action(
     if file is not None:
         try:
             run_profile_path(file)
-        except ProfileError as err:
+        except (ProfileError, FileExistsError, ValueError) as err:
             fail(str(err))
     elif editor is not None:
         edit_profile(editor)
@@ -290,6 +395,21 @@ def _error_banner(problem: str) -> str:
     return "".join(f"{_ERROR_COMMENT_PREFIX}{line}\n" for line in lines)
 
 
+def _theme_collision(parsed: ParsedProfile) -> str | None:
+    """A user-facing message when generating `parsed` would hit an existing file."""
+    if parsed.if_exists == "overwrite":
+        return None
+    for destination in _theme_destinations(
+        parsed.inputs.name, THEMES_DIR, parsed.register
+    ):
+        if destination.exists():
+            return (
+                f"{destination} already exists "
+                '(add if_exists = "overwrite" or change the name)'
+            )
+    return None
+
+
 def edit_profile(generator_name: str) -> pathlib.Path:
     """Author a profile in $EDITOR, save it to profiles/, and build the theme.
 
@@ -307,31 +427,43 @@ def edit_profile(generator_name: str) -> pathlib.Path:
         generator_name, generator_cls.inputs_spec, generator_cls.summary
     )
     # The path only gives the editor a .toml suffix to highlight; cyclopts
-    # always deletes it, so the buffer text is what carries the result.
-    scratch = (
-        pathlib.Path(tempfile.gettempdir()) / f"ztg-{generator_name}-{os.getpid()}.toml"
-    )
-    while True:
-        try:
-            edited = cyclopts.edit(text, path=scratch, required=False)
-        except EditorNotFoundError:
-            fail("no editor found; set $EDITOR")
-        except EditorDidNotSaveError:
-            fail("editor closed without saving; aborted, no profile written")
-        except EditorError as err:
-            fail(f"editor failed: {err}")
-        body = _strip_error_comments(edited)
-        try:
-            parsed = parse_profile_document(tomllib.loads(body), source="editor buffer")
-            break
-        except tomllib.TOMLDecodeError as err:
-            problem = f"invalid TOML: {err}"
-        except ProfileError as err:
-            problem = str(err)
-        if edited == text:
-            # A retry round saved with no changes: stop looping, report loudly.
-            fail(problem)
-        text = _error_banner(problem) + body
+    # rewrites and deletes it every round, so the buffer text is what carries
+    # the result. mkstemp keeps the name unpredictable.
+    fd, scratch_name = tempfile.mkstemp(prefix=f"ztg-{generator_name}-", suffix=".toml")
+    os.close(fd)
+    scratch = pathlib.Path(scratch_name)
+    try:
+        while True:
+            try:
+                edited = cyclopts.edit(text, path=scratch, required=False)
+            except EditorNotFoundError:
+                fail("no editor found; set $EDITOR")
+            except EditorDidNotSaveError:
+                fail("editor closed without saving; aborted, no profile written")
+            except EditorError as err:
+                fail(f"editor failed: {err}")
+            body = _strip_error_comments(edited)
+            try:
+                parsed = parse_profile_document(
+                    tomllib.loads(body), source="editor buffer"
+                )
+            except tomllib.TOMLDecodeError as err:
+                problem = f"invalid TOML: {err}"
+            except ProfileError as err:
+                problem = str(err)
+            else:
+                # Pre-flight theme collisions too: nothing is written until
+                # the buffer names a run that can actually complete.
+                collision = _theme_collision(parsed) if EDITOR_MODE_GENERATES else None
+                if collision is None:
+                    break
+                problem = collision
+            if edited == text:
+                # A retry round saved with no changes: stop looping, report loudly.
+                fail(problem)
+            text = _error_banner(problem) + body
+    finally:
+        scratch.unlink(missing_ok=True)
     if parsed.generator_cls is not generator_cls:
         fail(
             f"profile generator changed to {parsed.generator_cls.generator_name!r}; "
@@ -342,12 +474,18 @@ def edit_profile(generator_name: str) -> pathlib.Path:
     profile_path.write_text(body)
     print(f"Saved profile {profile_path}")
     if EDITOR_MODE_GENERATES:
-        run_generator(
-            parsed.generator_cls,
-            parsed.inputs,
-            register=parsed.register,
-            if_exists=parsed.if_exists,
-        )
+        try:
+            # The verbatim buffer written above IS the profile (comments and
+            # all), so the runner's re-rendered auto-save is switched off.
+            run_generator(
+                parsed.generator_cls,
+                parsed.inputs,
+                register=parsed.register,
+                if_exists=parsed.if_exists,
+                save_profile=False,
+            )
+        except (FileExistsError, ValueError) as err:
+            fail(str(err))
     return profile_path
 
 
@@ -355,7 +493,22 @@ def edit_profile(generator_name: str) -> pathlib.Path:
 
 _console = Console()
 # Command-action flags handled at the confirmation step, not as questions.
-_WIZARD_SKIP = frozenset({"--register", "--if-exists"})
+_WIZARD_SKIP = frozenset({"--register", "--if-exists", "--save-profile"})
+# Curated rich named colours spanning the hue wheel, shown as a reference
+# strip before the wizard's colour questions. All are 256-palette names, so
+# each block renders exactly the hex printed beneath it on any terminal.
+_SWATCH_COLORS: tuple[str, ...] = (
+    "red1",
+    "orange1",
+    "yellow1",
+    "green1",
+    "cyan1",
+    "deep_sky_blue1",
+    "blue1",
+    "purple",
+    "magenta1",
+    "deep_pink2",
+)
 
 
 def _ask(prompt: str, *, default: str | None = None) -> str:
@@ -395,6 +548,7 @@ def run_wizard(preselect: str | None) -> None:
 
 
 def _wizard(preselect: str | None) -> None:
+    _print_color_swatch()
     generator_name = _select_generator(preselect)
     subapp = app[generator_name]
     collection = subapp.assemble_argument_collection(parse_docstring=True)
@@ -408,16 +562,24 @@ def _wizard(preselect: str | None) -> None:
     if not _confirm("Generate theme?", default=True):
         print("Aborted.")
         return
-    if _confirm("Register into ~/.config/zed/themes?", default=False):
+    register = _confirm("Register into ~/.config/zed/themes?", default=False)
+    if register:
         tokens.append("--register")
+    name = next(a.values[0] for a in answers if a.name == "--name")
+    if any(d.exists() for d in _theme_destinations(name, THEMES_DIR, register)):
+        if not _confirm(f"theme {name!r} already exists — overwrite?", default=False):
+            print("Aborted.")
+            return
+        # The sticky opt-in: the flag reaches run_generator, which records
+        # if_exists = "overwrite" in the auto-saved profile.
+        tokens.extend(("--if-exists", "overwrite"))
     try:
         app(tokens)
-    except ValueError as err:
+    except (ValueError, FileExistsError) as err:
         # Generation-time constraint failures (e.g. a dark background handed
-        # to the light generator) arrive as plain ValueErrors; report cleanly.
+        # to the light generator) arrive as plain ValueErrors, collisions the
+        # confirm above could not foresee as FileExistsError; report cleanly.
         fail(str(err))
-    if _confirm("Save these inputs as a reusable profile?", default=False):
-        _save_wizard_profile(generator_name, answers)
 
 
 def _select_generator(preselect: str | None) -> str:
@@ -551,6 +713,23 @@ def _build_tokens(command: str, answers: list[_Answer]) -> list[str]:
     return tokens
 
 
+def _print_color_swatch() -> None:
+    """Show a small colour strip so colour questions aren't answered blind."""
+    _console.print(
+        "[bold]Colour reference[/bold] [dim](inputs accept any CSS colour string)[/dim]"
+    )
+    blocks = Text()
+    labels = Text()
+    for name in _SWATCH_COLORS:
+        blocks.append("███".ljust(8), style=name)
+        labels.append(RichColor.parse(name).get_truecolor().hex.ljust(8), style="dim")
+    _console.print(blocks)
+    _console.print(labels)
+    _console.print(
+        "[dim]full chart: https://rich.readthedocs.io/en/stable/appendix/colors.html[/dim]"
+    )
+
+
 def _print_summary(answers: list[_Answer], tokens: list[str]) -> None:
     table = Table(title="Inputs", show_header=False)
     for answer in answers:
@@ -560,25 +739,10 @@ def _print_summary(answers: list[_Answer], tokens: list[str]) -> None:
     _console.print(f"[dim]equivalent: {shlex.join(['ztg', *tokens])}[/dim]")
 
 
-def _save_wizard_profile(generator_name: str, answers: list[_Answer]) -> pathlib.Path:
-    """Persist the wizard's answers as profiles/<name>.toml for later `-f` runs."""
-    generator_cls = GENERATORS[generator_name]
-    doc: dict[str, object] = {}
-    for answer in answers:
-        if not answer.values:
-            continue
-        field_name = answer.name.removeprefix("--").replace("-", "_")
-        if answer.grouped or len(answer.values) > 1:
-            doc[field_name] = list(answer.values)
-        else:
-            doc[field_name] = answer.values[0]
-    inputs = TypeAdapter(generator_cls.inputs_spec).validate_python(doc)
-    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
-    path = PROFILES_DIR / f"{inputs.name}.toml"
-    path.write_text(render_profile(generator_name, inputs))
-    print(f"Saved profile {path}")
-    return path
-
-
 def main() -> None:
-    app()
+    try:
+        app()
+    except FileExistsError as err:
+        # Typed commands dispatch straight to run_generator; a collision there
+        # is a user decision to make, not a traceback.
+        fail(str(err))
